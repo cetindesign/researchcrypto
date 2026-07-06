@@ -1,117 +1,164 @@
 ---
 name: backtesting-engine
-description: Backtesting crypto strategies correctly for Bybit perpetuals in Python — event-driven vs vectorized engines, avoiding look-ahead and survivorship bias, realistic slippage/fee/funding modeling for Bybit perps, in-sample vs out-of-sample and walk-forward analysis, overfitting control, and performance metrics (Sharpe, Sortino, Calmar, max drawdown, CAGR, profit factor). Invoke when the user mentions "backtest", "walk-forward", "out-of-sample", "look-ahead bias", "survivorship", "slippage/fees/funding modeling", "overfitting", "Sharpe/Sortino/max drawdown/profit factor", "vectorbt", "backtesting.py", "Freqtrade backtesting", or asks whether a strategy's historical results are trustworthy.
+description: Validating Bybit-perp trading strategies in TypeScript (Bun) by replaying stored candle and v3_decision_log data through the SAME pure-core decision functions the live engine uses. Covers realistic Bybit V5 linear-perp cost modeling (taker/maker fees, slippage, 8h funding), avoiding look-ahead and survivorship bias, next-bar MARKET fills that mirror the polling engine, walk-forward and in-sample/out-of-sample splits, overfitting control, and metrics (Sharpe, Sortino, Calmar, max drawdown, profit factor, win rate) — all in bun:test-friendly pure TS. Note: if the repo has no formal backtester yet, this is guidance to build one AROUND the pure core, not a separate Python engine. Invoke when the user mentions "backtest", "replay decision log", "walk-forward", "out-of-sample", "look-ahead", "survivorship", "fees/slippage/funding modeling", "overfitting", "Sharpe/Sortino/max drawdown/profit factor", or "is this strategy's history trustworthy?".
 ---
 
 # Backtesting Engine
 
 ## When to use this skill
-- "Backtest this strategy on BTCUSDT perps over the last 2 years."
-- Choosing between a vectorized (vectorbt) and event-driven (backtesting.py / Freqtrade / Jesse / custom) engine.
-- Making fills realistic: modeling Bybit taker/maker fees, slippage, and funding on perps.
-- Setting up in-sample/out-of-sample splits or walk-forward analysis.
-- Interpreting metrics and detecting overfitting ("Sharpe 4 in backtest, is it real?").
-- Debugging suspiciously good results (look-ahead, survivorship, data quality).
+- "Backtest the v3 strategy on BTCUSDT perps over the last 2 years" using the pure core, not a rewrite.
+- Replaying stored klines (and optionally `v3_decision_log`) through `decide()` to reproduce past behavior.
+- Making simulated fills realistic: Bybit taker/maker fees, slippage on MARKET orders, 8h funding.
+- Setting up in-sample/out-of-sample splits or walk-forward before trusting an optimizer result.
+- Interpreting metrics and catching overfitting ("Sharpe 4 in backtest — is it real?").
+- Debugging suspiciously good results: look-ahead on the forming candle, survivorship, data gaps.
 
 ## Core concepts
-- **Vectorized backtesting**: apply signals across the whole price array at once (numpy/pandas). Extremely fast — vectorbt tests thousands of parameter sets in seconds — but easy to leak future data and awkward for path-dependent logic (trailing stops, pyramiding, dynamic sizing).
-- **Event-driven backtesting**: feed candles one bar at a time; the strategy only ever sees data up to "now". Structurally prevents look-ahead (backtesting.py's `Strategy.next()` only exposes data up to the current index; Jesse and Freqtrade are event/loop driven). Slower but faithful to how a live OMS behaves.
-- **Look-ahead bias**: using data not available at decision time — deciding on the current unclosed bar, using the close to fill at the open, `.shift(-1)`, whole-series `max/min`, or indicators that repaint. The #1 cause of fake profits.
-- **Survivorship bias**: backtesting only symbols that still trade today, ignoring delisted/failed coins. On crypto this is severe — many alts went to zero. Use a point-in-time symbol universe.
-- **In-sample (IS) vs out-of-sample (OOS)**: optimize on IS, then evaluate untouched OOS. A strategy that only works IS is curve-fit.
-- **Walk-forward analysis (WFA)**: roll the IS/OOS windows forward (optimize on window N, test on N+1, advance, repeat) and stitch the OOS results. This is the gold standard for judging whether an optimization process generalizes, not just one lucky split.
-- **Overfitting**: fitting noise. Symptoms: great IS / poor OOS, a fragile "peak" in the parameter surface, too many parameters, unrealistic Sharpe. Prefer a broad plateau of good parameters over a sharp spike.
+- **Reuse the pure core.** The live v3 engine's decisions come from pure functions (`decide()`, `guardEntry()` — see `strategy-development`). The backtester's only job is to feed those functions historical bars **one closed candle at a time** and simulate the MARKET fills the engine would have sent. If backtest and live share the core, a passing backtest actually means something.
+- **The platform is MARKET-order + decision-log based.** There are no resting limit orders to model queue position for. Entries and exits are taker MARKET orders; TP/SL/trailing are evaluated in software and closed with a MARKET order. So the fill model is: cross the spread + slippage, pay the taker fee.
+- **Replay two ways.** (1) *Signal replay*: run `decide()` over historical candles and simulate fills — tests the strategy end-to-end. (2) *Decision replay*: read the actual `v3_decision_log` rows and re-price them under the cost model — tests "what did our real decisions cost/earn" and validates the engine matches the core.
+- **Look-ahead bias.** #1 source of fake profit. Decide on candle *i* (closed), fill at candle *i+1*'s open — never same-bar close. The core already drops the forming bar; the backtester must not hand it future bars either.
+- **Survivorship bias.** Crypto alts get delisted / go to zero. If the coin-selector scans many symbols, backtest a point-in-time universe that includes delisted symbols, or you overstate returns.
+- **In-sample vs out-of-sample & walk-forward.** Optimize on IS, judge on untouched OOS. Walk-forward rolls the windows (optimize N, test N+1, advance) and stitches OOS results — the honest test of whether the optimizer generalizes rather than curve-fits one lucky split.
+- **Overfitting.** Great IS / poor OOS, a sharp parameter peak, too many knobs, unrealistic Sharpe. Prefer a broad plateau of decent params over a spike.
 
-## Bybit / Python specifics
-Realistic cost model for **Bybit USDT perpetuals** (linear):
-- **Fees**: default VIP-0 perp fees are roughly **maker 0.02% / taker 0.055%** (fetch live values via `/v5/account/fee-rate`; never hardcode blindly). Post-only limit fills earn the maker rate (or a rebate at higher tiers); market and marketable limits pay taker.
-- **Funding**: perps pay/receive funding every 8h (00:00/08:00/16:00 UTC) at the symbol's funding rate. A backtest that ignores funding overstates PnL for positions held across funding stamps. Pull historical funding (`/v5/market/history-fund-rate`) and apply `position_notional * funding_rate` at each stamp, sign by side.
-- **Slippage**: model at least a fixed spread + size-dependent impact. For a taker entry, fill at `mid ± spread/2` plus impact; better, replay the L1/L2 book if you have it. Assume you do NOT get the best bid/ask for free.
-- **Contract rules**: respect `qtyStep`, `minOrderQty`, `tickSize`, and `minNotional` from `/v5/market/instruments-info` — round sizes/prices the same way live orders will be, or fills won't match reality.
-- **Leverage/liquidation**: model maintenance margin and liquidation for leveraged perp tests; a strategy can be "profitable" while occasionally getting liquidated.
-
-Data sourcing: fetch klines via pybit `get_kline` or CCXT `fetch_ohlcv('BTC/USDT:USDT', ...)` on the `bybit` id, paginating. Bybit returns a max of 1000 klines per request — page by time and de-duplicate. Verify no gaps/duplicates and consistent timezone (UTC).
-
-Engines commonly used: **backtesting.py** (lightweight event-driven, built-in Sharpe/drawdown), **vectorbt** (vectorized, numba-accelerated, mass parameter sweeps, QuantStats integration), **Freqtrade backtesting** (built for crypto exchanges incl. Bybit, has lookahead/recursive-analysis tooling and hyperopt), **Jesse** (crypto-native, event-driven, no look-ahead by design).
+## Codebase specifics
+- **Language/runtime.** TypeScript + Bun. The backtester is plain TS the same monorepo package(s) can import; assertions and fixtures run under `bun test`. No Python, pandas, vectorbt, or Freqtrade.
+- **If no backtester exists yet.** Per the repo, the live system is a polling engine with a decision log; a formal backtester may be absent. Build a small event loop AROUND the pure core rather than porting a Python framework — a for-loop over candles, a cost-modeled fill, an equity array, and a metrics function.
+- **Data source.** Historical klines come from the same Bybit V5 REST (`/v5/market/kline`, newest-first string arrays, max 1000/req — page by time and de-dup) that the collector polls, and/or the `collector` price snapshots already stored in MySQL (read via Drizzle). Normalize to oldest-first numeric candles once.
+- **Costs to pull, not guess.** Fetch live fees from `/v5/account/fee-rate` and historical funding from `/v5/market/history-fund-rate`; respect `qtyStep`/`tickSize`/`minOrderQty` from `/v5/market/instruments-info` so simulated sizes match what live orders would round to.
+- **Bybit linear perps, one-way mode.** Model funding every 8h (00:00/08:00/16:00 UTC), sign by side; a backtest ignoring funding on held positions overstates PnL.
+- **Bybit-only.** No Binance data or examples.
 
 ## Implementation checklist
-- [ ] Load clean OHLCV: UTC, no gaps, no duplicate timestamps, monotonic index.
-- [ ] Build a point-in-time symbol universe (include delisted symbols) to avoid survivorship bias.
-- [ ] Signals fire on the closed bar; fills happen on the NEXT bar's open (never same-bar close).
-- [ ] Apply Bybit fees (maker vs taker by order type), slippage, and 8h funding at each stamp.
-- [ ] Round sizes/prices to `qtyStep`/`tickSize`; reject sub-`minOrderQty`/`minNotional` trades.
-- [ ] Split IS/OOS; run walk-forward, not a single split.
-- [ ] Report Sharpe, Sortino, Calmar, max drawdown, CAGR, profit factor, win rate, trade count, exposure.
-- [ ] Run a look-ahead detector (Freqtrade `lookahead-analysis`) and a shift-invariance/repaint test.
-- [ ] Compare against a benchmark (buy-and-hold BTC) and a randomized/shuffled-signal null.
+- [ ] Load clean klines: UTC ms timestamps, oldest-first, no gaps, no duplicate `start`, monotonic.
+- [ ] Feed the pure `decide()` closed candles only; fill the resulting MARKET order at the **next** bar's open.
+- [ ] Apply taker fee + slippage on every entry/exit; apply 8h funding to positions open across a stamp.
+- [ ] Round sizes to `qtyStep`/`minOrderQty` exactly as the OMS will; reject sub-minimum trades.
+- [ ] Use a point-in-time universe (include delisted symbols) if the coin-selector scans many coins.
+- [ ] Split IS/OOS and run walk-forward — never optimize and report on the same data.
+- [ ] Report Sharpe, Sortino, Calmar, max drawdown, profit factor, win rate, trade count, exposure.
+- [ ] Add a look-ahead assertion (a future bar must not change a past decision) and a funding-omission check.
+- [ ] Compare against buy-and-hold BTC and a shuffled-signal null.
 
 ## Do / Don't
 **Do**
-- Fill at next-bar open (or intrabar with conservative slippage), matching live latency.
-- Fetch live fee tiers and funding history; apply them per trade and per stamp.
-- Judge robustness by OOS/walk-forward performance and parameter-surface flatness.
-- Keep enough trades (rule of thumb: 100+) for metrics to mean anything.
+- Drive the backtest through the exact pure-core functions the live engine calls.
+- Fill at next-bar open with taker fee + slippage to mirror the ~10s polling MARKET engine.
+- Pull real fee tiers and funding history and apply them per trade and per 8h stamp.
+- Judge robustness by OOS / walk-forward and parameter-surface flatness, not a single Sharpe.
+- Keep enough trades (100+) for metrics to be meaningful.
 
 **Don't**
-- Don't optimize and report on the same data (that number is meaningless).
+- Don't fork the strategy math into the backtester — divergence makes the test worthless.
+- Don't fill on the same bar you decided on, or use the forming candle's close.
 - Don't ignore funding, fees, or slippage — they routinely flip a "winner" negative on perps.
-- Don't trust a single dazzling Sharpe; check drawdown, trade count, and OOS.
-- Don't backtest only currently-listed coins if the strategy scans many symbols.
+- Don't optimize and evaluate on the same data, or report the best of a thousand sweeps as expected.
+- Don't backtest only currently-listed coins if the selector scans a changing universe.
 
 ## Common pitfalls
-- **Same-bar look-ahead**: computing a signal from a bar's close and filling at that same close/open. Delay the fill by one bar.
-- **Funding omission**: holding a perp for days without applying 8h funding can hide a large cost (or gain).
-- **Fee under-modeling**: assuming maker fees for orders that actually cross as taker. If you don't guarantee post-only, assume taker.
-- **Data survivorship & quality**: missing candles filled by forward-fill create phantom flat periods; duplicate timestamps double-count. Validate before backtesting.
-- **Metric misuse**: annualize Sharpe with the right periods-per-year for your bar size; a crypto market trades 24/7/365, so use 365 (not 252) trading days. Sortino needs a target/MAR; Calmar = CAGR / |max drawdown|.
-- **Multiple-testing / p-hacking**: sweeping thousands of parameter sets and picking the best inflates Sharpe by chance. Use walk-forward and out-of-sample to discount it.
-- **Position-size look-ahead**: sizing off the future equity curve or future volatility.
+- **Same-bar look-ahead.** Deciding from bar *i*'s close and filling at bar *i*'s close/open. Delay the fill by one bar.
+- **Funding omission.** Holding a perp for days without applying 8h funding hides a real cost (or gain).
+- **Fee under-modeling.** The platform's MARKET orders are *always* taker — never assume the maker rate.
+- **Data quality.** Forward-filled missing candles create phantom flat periods; duplicate `start` timestamps double-count. Validate before running.
+- **Metric misuse.** Crypto trades 24/7/365 — annualize Sharpe with 365 (not 252). Sortino needs a target/MAR; Calmar = CAGR / |maxDD|.
+- **p-hacking.** Sweeping thousands of parameter sets and reporting the best inflates Sharpe by luck. Discount with walk-forward/OOS.
+- **Backtester-vs-engine drift.** If decision replay of `v3_decision_log` doesn't match a fresh signal replay, the engine has inlined logic that diverges from the pure core — fix the engine.
 
 ## Code patterns
-Applying Bybit costs inside an event-driven fill:
+Bybit MARKET-fill cost model + 8h funding (pure TypeScript):
 
-```python
-TAKER = 0.00055   # confirm via /v5/account/fee-rate
-MAKER = 0.00020
+```ts
+const TAKER = 0.00055;  // confirm via /v5/account/fee-rate; platform orders are always taker
 
-def fill(side, price, qty, is_maker, spread):
-    # taker crosses the spread; add slippage on top of the fee
-    slip = 0.0 if is_maker else spread / 2
-    exec_price = price + slip if side == "buy" else price - slip
-    fee = exec_price * qty * (MAKER if is_maker else TAKER)
-    return exec_price, fee
+/** MARKET fill: cross the spread, add slippage, pay taker fee. */
+export function marketFill(side: "buy" | "sell", mid: number, qty: number, spread: number, slipBps = 1) {
+  const slip = spread / 2 + mid * (slipBps / 10_000);
+  const price = side === "buy" ? mid + slip : mid - slip;
+  const fee = price * qty * TAKER;
+  return { price, fee };
+}
 
-def apply_funding(position_notional, funding_rate, side):
-    # charged every 8h; long pays when rate > 0
-    sign = 1 if side == "long" else -1
-    return -sign * position_notional * funding_rate
+/** Funding is charged every 8h; a long pays when the rate is positive. */
+export function fundingCost(notional: number, rate: number, side: "long" | "short") {
+  const sign = side === "long" ? 1 : -1;
+  return -sign * notional * rate;
+}
 ```
 
-Walk-forward skeleton:
+Event loop that replays candles through the pure core (no look-ahead: fill next bar):
 
-```python
-def walk_forward(data, optimize, evaluate, is_len, oos_len, step):
-    oos_results = []
-    start = 0
-    while start + is_len + oos_len <= len(data):
-        is_slice  = data.iloc[start : start + is_len]
-        oos_slice = data.iloc[start + is_len : start + is_len + oos_len]
-        best_params = optimize(is_slice)                 # fit on IS only
-        oos_results.append(evaluate(oos_slice, best_params))  # judge on OOS
-        start += step
-    return oos_results   # stitch and analyze the OOS curve only
+```ts
+import { decide, type Candle, type StrategyConfig, type GuardState } from "@repo/strategy-core";
+
+export function backtest(candles: Candle[], cfg: StrategyConfig, guardAt: (t: number) => GuardState) {
+  let cash = 10_000, pos: { size: number; avgPrice: number; layers: number } | null = null;
+  const equity: number[] = [];
+  for (let i = 0; i < candles.length - 1; i++) {
+    const window = candles.slice(0, i + 1);            // closed bars up to i
+    const d = decide(window, cfg, guardAt(candles[i].start), pos);
+    const nextOpen = candles[i + 1].open;              // fill on the NEXT bar's open
+    if (d.action === "enterLong") {
+      const qty = (cash * (d.sizeWeight ?? 1)) / nextOpen;
+      const { price, fee } = marketFill("buy", nextOpen, qty, /*spread*/ nextOpen * 0.0002);
+      pos = { size: qty, avgPrice: price, layers: 1 }; cash -= fee;
+    } else if (d.action === "close" && pos) {
+      const { price, fee } = marketFill("sell", nextOpen, pos.size, nextOpen * 0.0002);
+      cash += pos.size * (price - pos.avgPrice) - fee; pos = null;
+    }
+    equity.push(cash + (pos ? pos.size * (nextOpen - pos.avgPrice) : 0));
+  }
+  return equity;
+}
+```
+
+Metrics (crypto = 365d) and a walk-forward skeleton:
+
+```ts
+export function sharpe(returns: number[], periodsPerYear = 365) {
+  const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
+  const sd = Math.sqrt(returns.reduce((a, b) => a + (b - mean) ** 2, 0) / returns.length);
+  return sd === 0 ? 0 : (mean / sd) * Math.sqrt(periodsPerYear);
+}
+export function maxDrawdown(equity: number[]) {
+  let peak = equity[0], mdd = 0;
+  for (const e of equity) { peak = Math.max(peak, e); mdd = Math.min(mdd, e / peak - 1); }
+  return mdd; // negative
+}
+
+export function walkForward<T>(
+  data: T[], isLen: number, oosLen: number, step: number,
+  optimize: (s: T[]) => StrategyConfig, evaluate: (s: T[], c: StrategyConfig) => number,
+) {
+  const oos: number[] = [];
+  for (let start = 0; start + isLen + oosLen <= data.length; start += step) {
+    const best = optimize(data.slice(start, start + isLen));                    // fit on IS only
+    oos.push(evaluate(data.slice(start + isLen, start + isLen + oosLen), best)); // judge on OOS only
+  }
+  return oos;
+}
+```
+
+Look-ahead assertion with `bun:test`:
+
+```ts
+import { test, expect } from "bun:test";
+test("a future bar never changes a past decision", () => {
+  const upto = candles.slice(0, 500);
+  const a = decide(upto, cfg, guard, null);
+  const b = decide([...upto, candles[500]], cfg, guard, null); // append a FUTURE bar
+  expect(a).toEqual(b); // the pure core decides on closed bars up to the same point
+});
 ```
 
 ## References
-- [Backtesting.py documentation](https://kernc.github.io/backtesting.py/) — event-driven engine; `init()`/`next()` prevent look-ahead; built-in stats.
-- [Backtesting.py API reference](https://kernc.github.io/backtesting.py/doc/backtesting/backtesting.html) — Backtest/Strategy/Trade objects, fees (`commission`) and slippage options.
-- [vectorbt — getting started](https://vectorbt.dev/) — vectorized, numba-accelerated backtesting and mass parameter sweeps.
-- [vectorbt GitHub](https://github.com/polakowo/vectorbt) — Portfolio API, fees/slippage params, metrics.
-- [Backtesting — Freqtrade](https://www.freqtrade.io/en/stable/backtesting/) — crypto exchange backtesting with realistic fees/funding and detailed metric tables.
-- [Lookahead analysis — Freqtrade](https://www.freqtrade.io/en/stable/lookahead-analysis/) — automated future-data leak detection.
-- [Recursive analysis — Freqtrade](https://www.freqtrade.io/en/stable/recursive-analysis/) — detects indicator repainting via history-length variance.
-- [Hyperopt — Freqtrade](https://www.freqtrade.io/en/stable/hyperopt/) — parameter optimization with IS/OOS and overfitting caveats.
-- [Jesse GitHub](https://github.com/jesse-ai/jesse) — crypto-native event-driven backtester with no look-ahead by design.
-- [QuantStats GitHub](https://github.com/ranaroussi/quantstats) — Sharpe, Sortino, Calmar, max_drawdown, CAGR, profit_factor implementations and tearsheets.
-- [Bybit Fee Rate API](https://bybit-exchange.github.io/docs/v5/account/fee-rate) — live maker/taker fees to feed the cost model.
-- [Bybit Instruments Info API](https://bybit-exchange.github.io/docs/v5/market/instrument) — qtyStep, tickSize, minOrderQty, minNotional for realistic rounding.
+- [Bun — Test runner (`bun:test`)](https://bun.com/docs/test) — assertions and fixtures for deterministic backtest checks.
+- [Bun — Documentation](https://bun.com/docs) — running TS backtest scripts and packages under Bun.
+- [Turborepo — Introduction](https://turborepo.dev/docs) — importing the shared pure-core package into the backtester.
+- [Drizzle ORM — MySQL get started](https://orm.drizzle.team/docs/mysql/get-started-mysql) — reading stored klines / `v3_decision_log` for replay.
+- [Bybit V5 — Get Kline](https://bybit-exchange.github.io/docs/v5/market/kline) — historical candles, 1000-row limit, newest-first ordering, pagination.
+- [Bybit V5 — Get Funding Rate History](https://bybit-exchange.github.io/docs/v5/market/history-fund-rate) — 8h funding stamps to charge held positions.
+- [Bybit V5 — Get Fee Rate](https://bybit-exchange.github.io/docs/v5/account/fee-rate) — live maker/taker fees to feed the MARKET cost model.
+- [Bybit V5 — Get Instruments Info](https://bybit-exchange.github.io/docs/v5/market/instrument) — `qtyStep`/`tickSize`/`minOrderQty` for realistic rounding.
+- [Bybit V5 — Get Position Info](https://bybit-exchange.github.io/docs/v5/position) — fields to reconcile decision-replay results against real positions.
+- [Bybit V5 — Introduction](https://bybit-exchange.github.io/docs/v5/intro) — linear perps, categories, one-way mode assumptions for the simulator.

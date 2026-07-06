@@ -1,161 +1,150 @@
 ---
 name: monitoring-observability
-description: Observability for a multi-bot Bybit crypto trading platform in Python/FastAPI/asyncio. Covers Prometheus metrics (order-submit/fill latency histograms, fill rate, WebSocket disconnects/reconnects, Bybit API error rate and rate-limit usage, realized/unrealized PnL, position and exposure gauges, per-bot heartbeat), the prometheus_client and prometheus-fastapi-instrumentator libraries, Grafana dashboards, alerting with Alertmanager and Grafana Alerting routed to Telegram/Discord/PagerDuty (stuck/silent bot, drawdown breach, WS disconnect, high error rate, PnL anomaly), structured JSON logging with structlog and correlation/trace IDs, distributed tracing with OpenTelemetry, SLIs/SLOs/error budgets and burn-rate alerts, and health/readiness/liveness probes. Invoke when the task mentions metrics, Prometheus, Grafana, dashboard, alert, Alertmanager, /metrics, counter/gauge/histogram, heartbeat, dead-man switch, drawdown alert, latency, structured logs, structlog, tracing, OpenTelemetry, span, SLO, error budget, health check, liveness, or readiness.
+description: Observability for a single-process, polling, multi-loop Bybit crypto trading platform on Bun + Hono + tRPC + Drizzle/MySQL. Covers Telegram notifications as the platform's alert channel (stuck/silent loop, drawdown breach, reconcile drift, high Bybit error rate, rate-limit exhaustion), a per-loop heartbeat / dead-man's switch using last-tick timestamps for the 6 background loops (collector, v3 Bybit engine, optimizer, calendar scraper, news scraper), the v3_decision_log / v3_position_event audit trail as the primary forensic tool, structured JSON logging in TypeScript with a request/loop correlation id, a Hono /health endpoint reporting per-loop liveness + DB + Bybit reachability, and latency/fill tracking around signed REST round-trips. Prometheus/Grafana are called out as an OPTIONAL future add-on, not the current setup. Invoke when the task mentions monitoring, observability, Telegram alert, heartbeat, dead-man switch, stuck/silent loop, last-tick, drawdown alert, reconcile drift, Bybit error rate, rate limit, health endpoint, /health, liveness, structured logs, correlation id, latency, fill tracking, or "why didn't we get alerted".
 ---
 
 # Monitoring & Observability
 
 ## When to use this skill
-- Instrumenting bots or the FastAPI API with Prometheus metrics (order latency, fill rate, WS disconnects, API errors, PnL, heartbeat).
-- Designing Grafana dashboards for trading health and PnL.
-- Writing alert rules (Alertmanager / Grafana Alerting) and routing to Telegram/Discord/PagerDuty.
-- Adding structured logs, correlation IDs, or OpenTelemetry tracing.
-- Defining SLIs/SLOs and burn-rate alerts, or adding health/readiness/liveness endpoints.
-- Diagnosing a "bot went silent", "orders are slow", or "we didn't get alerted" incident.
+- Instrumenting the 6 background loops or the Hono/tRPC API with heartbeats, health checks, and latency tracking.
+- Wiring Telegram notifications for operational alerts (silent loop, drawdown, reconcile drift, Bybit error spikes, rate-limit).
+- Designing a per-loop dead-man's switch (last-tick timestamp) so a hung loop is detected even though the process is up.
+- Using `v3_decision_log` / `v3_position_event` to reconstruct "why did the bot do X" after an incident.
+- Adding a `/health` endpoint reporting per-loop liveness + DB + Bybit reachability for Dokploy/uptime checks.
+- Diagnosing "a loop went silent", "orders are slow", "reconcile keeps drifting", or "we didn't get alerted".
 
 ## Core concepts
-The **three pillars**: metrics (aggregatable numbers over time), logs (discrete structured events), traces (causal spans across services). For trading you also need a **dead-man's-switch / heartbeat**: proof each bot is *alive and acting*, not just that the process is up.
+This platform is **one Bun process** that on boot starts **6 periodic polling loops** (no WebSocket): `collector`, `v3 Bybit engine` (~10s), `optimizer` (~2h), `calendar scraper` (~15m), `news scraper` (~3m). Observability must answer, per loop: *is it alive, is it on time, is it succeeding, and what did it decide?*
 
-Prometheus metric types:
-- **Counter** — monotonically increasing (orders submitted, API errors, WS reconnects). Query rate with `rate()`/`increase()`.
-- **Gauge** — value that goes up/down (open positions, current exposure, unrealized PnL, queue depth, last-heartbeat-age).
-- **Histogram** — bucketed distribution (order round-trip latency); gives you `_bucket`, `_sum`, `_count` and lets you compute p50/p95/p99 with `histogram_quantile()`.
-- **Summary** — client-side quantiles; prefer histograms so you can aggregate across instances.
+- **Liveness vs "alive and acting"**: the container being up says nothing about a hung loop. You need a **heartbeat / dead-man's switch**: each loop writes `lastTickAt = Date.now()` at the end of every iteration; a watchdog alerts when `now - lastTickAt > expectedInterval * k`.
+- **The audit trail is the primary forensic tool.** `v3_decision_log` (every engine decision + the guards that fired) and `v3_position_event` (every open/add/close/reconcile event) let you replay any incident. This is more valuable here than any metrics dashboard — treat it as first-class observability, not just bookkeeping.
+- **Symptoms over causes**: alert on *outcomes the operator cares about* — silent loop, drawdown breach, reconcile drift (DB vs exchange mismatch), Bybit error-rate spike, rate-limit near exhaustion — not on every transient error.
+- **Staleness detection** replaces WS-disconnect metrics: since everything is polling, "stale" means a loop's last successful tick, or a price snapshot in `collector`, is older than expected.
+- **Structured logs** (one JSON object per event, with a `loop` and correlation id) make the process greppable; they complement, not replace, the DB audit trail.
 
-Prometheus **pulls** (scrapes) a `/metrics` endpoint on an interval. Labels create separate time series — keep cardinality low (label by `bot_id`, `symbol`, `side`, `result`; **never** by order_id, timestamp, or raw price).
-
-SRE vocabulary:
-- **SLI** = a measured ratio of good/total events (e.g. successful order submits ÷ total).
-- **SLO** = target for an SLI over a window (e.g. 99.5% of order submits succeed over 28d).
-- **Error budget** = `1 - SLO`; a 99.9% SLO = 0.1% budget. Burn-rate alerts fire when you're spending the budget too fast.
-
-## Python & stack specifics
-- **`prometheus_client`** (official): define `Counter/Gauge/Histogram`, expose via `start_http_server(9100)` for worker bots, or mount an ASGI app / `make_asgi_app()` at `/metrics` in FastAPI.
-- **`prometheus-fastapi-instrumentator`**: one-liner auto-instrumentation of every route → `http_request_duration_seconds` histogram, request counts, sizes. Add custom metrics alongside it.
-- **Multiprocess**: under Gunicorn/Uvicorn workers, set `PROMETHEUS_MULTIPROC_DIR` and use the multiprocess collector, or each worker exposes its own port. Async bots typically each run their own metrics server on a distinct port.
-- **Histogram buckets matter**: the default buckets top out around 10s and are HTTP-shaped. For order latency define explicit buckets in **milliseconds→seconds** relevant to Bybit round-trips, e.g. `buckets=(.01,.025,.05,.1,.25,.5,1,2.5,5)`.
-- **Heartbeat pattern**: each bot sets a gauge `bot_last_loop_timestamp{bot_id=...}` to `time.time()` every loop; alert on `time() - bot_last_loop_timestamp > N` (dead-man's switch). This catches a hung asyncio loop that a liveness probe would miss.
-- **WS observability (Bybit V5)**: increment a `ws_disconnects_total{stream="public|private"}` counter on every reconnect; track `ws_last_message_timestamp` gauge — Bybit sends heartbeat/ping frames (~20s), so a stale timestamp means a silent stall even if TCP is up.
-- **API error/rate-limit**: label a counter by Bybit `retCode` (e.g. `10006` rate limit, `10016` server error); read the `X-Bapi-Limit-Status`/limit headers and export remaining-quota as a gauge to alert *before* you get banned.
-- **PnL & exposure**: export `unrealized_pnl`, `realized_pnl_total`, `position_notional`, and `account_equity` gauges (poll Bybit position/wallet endpoints) so drawdown and exposure alerts are metric-driven.
-- **structlog**: JSON renderer + `contextvars` to bind `request_id`/`trace_id`/`bot_id` on every line. Correlate logs↔traces by putting the OTel trace_id into the log context.
-- **OpenTelemetry Python**: `TracerProvider` + OTLP exporter; auto-instrument FastAPI/httpx; create manual spans around the order lifecycle (signal → risk check → submit → ack → fill). Propagate context into async tasks.
-- **Grafana + Alertmanager**: Grafana Alerting mirrors Prometheus alerting and can hand off to Alertmanager for routing/grouping/silencing. Use `for:` to require the condition to hold before firing (kills flapping). Route by severity to Telegram/Discord (webhook contact points) and page for criticals.
+## Codebase specifics (polling loops / Telegram / Hono / this platform)
+- **Telegram is the alert channel.** Send via `POST https://api.telegram.org/bot<token>/sendMessage` with `chat_id` + `text` (`parse_mode: "HTML"` for emphasis). Keep a tiny helper with a severity prefix, dedup/rate-limit (Telegram caps ~30 msg/s; you want far fewer), and a cooldown so a flapping condition doesn't spam the channel. Alert-worthy events: silent loop, drawdown breach, reconcile drift, high Bybit `retCode` rate, rate-limit exhaustion, kill-switch toggled, unhandled loop exception.
+- **Heartbeat per loop**: keep an in-memory `Map<LoopName, number>` of `lastTickAt`, updated at the end of each iteration, and persist a copy (or a `loop_heartbeat` table) so a restart and the `/health` endpoint can read it. A single watchdog interval compares each loop's age to its expected cadence and fires one Telegram alert (with cooldown) when a loop is silent.
+- **Reconcile drift**: the engine's core job is reconciling DB accounting to real Bybit positions. Count how often reconcile has to correct the DB and alert when drift exceeds a threshold in a window — persistent drift means the ledger and exchange disagree (a correctness bug or missed fill).
+- **Bybit error/rate-limit tracking**: bucket responses by `retCode` (e.g. `10006` rate limit, `10016`/`10002` server/timestamp) and by HTTP timeout; alert on error-rate over a rolling window. Read Bybit's `X-Bapi-Limit-Status` / limit headers and alert *before* exhaustion so you throttle instead of getting banned.
+- **Latency & fills**: wrap each signed REST call and record duration (`Date.now()` deltas) and outcome; log p50/p95-ish rollups per loop. For orders, log request→ack latency and whether the MARKET close/entry actually filled (query back by `orderLinkId`). Persist notable timings to the audit tables for after-the-fact analysis.
+- **Structured logging in TS**: a thin JSON logger (or `pino`) writing one object per line with `{ ts, level, loop, corrId, event, ...fields }`. Generate a `corrId` per loop iteration and thread it through so all lines for one engine turn share an id. Never log secrets or raw Bybit responses containing keys.
+- **Hono `/health`**: a lightweight GET that returns `200` with each loop's last-tick age, a DB ping, and a cheap Bybit reachability check (e.g. server-time endpoint). Return `503` if any critical loop is stale or the DB is down so Dokploy / an external uptime probe (e.g. UptimeRobot hitting `/health`) can restart or page.
+- **Prometheus/Grafana are OPTIONAL and future**: the current stack does not scrape metrics. If richer time-series is wanted later, expose a `/metrics` endpoint and add Prometheus + Grafana as an add-on — but today the heartbeat + Telegram + `v3_decision_log` triad is the system.
 
 ## Implementation checklist
-- [ ] Expose `/metrics` on the API (instrumentator) and a metrics port per bot (`prometheus_client`).
-- [ ] Define core metrics: `order_submit_latency_seconds` (Histogram), `orders_total{result}`, `fills_total`, `order_fill_ratio` (or derive), `ws_disconnects_total`, `ws_last_message_timestamp`, `bybit_api_errors_total{retCode}`, `bybit_ratelimit_remaining`, `unrealized_pnl`, `realized_pnl_total`, `account_equity`, `position_notional{symbol}`, `bot_last_loop_timestamp{bot_id}`.
-- [ ] Choose explicit latency buckets sized to real Bybit round-trips; keep label cardinality low.
-- [ ] Configure Prometheus scrape targets + retention; add recording rules for p95 latency and PnL rollups.
-- [ ] Build Grafana dashboards: per-bot heartbeat/status, order latency p50/p95/p99, fill rate, WS health, API error rate, equity/drawdown curve, exposure.
-- [ ] Write alerts with `for:` durations: bot heartbeat stale, drawdown/equity breach, WS disconnect storm, API error-rate spike, rate-limit near exhaustion, no fills while orders submitted.
-- [ ] Route alerts by severity via Alertmanager/Grafana to Telegram/Discord + a pager for criticals; test each route.
-- [ ] Add structured JSON logging with correlation/trace IDs; ship to Loki/ELK.
-- [ ] Add OpenTelemetry tracing over the order lifecycle; correlate trace_id into logs.
-- [ ] Define SLIs/SLOs (order-submit success %, submit latency p95, WS uptime) and add multi-window burn-rate alerts.
-- [ ] Add `/healthz` (liveness) and `/readyz` (readiness: DB, Bybit connectivity, WS subscribed) probes.
+- [ ] Per-loop `lastTickAt` heartbeat updated at the end of every iteration; persisted for `/health` and restarts.
+- [ ] A single watchdog that compares each loop's age to its expected cadence and Telegram-alerts (with cooldown) on staleness.
+- [ ] Telegram helper with severity prefix, per-alert cooldown/dedup, and a hard rate cap.
+- [ ] Alerts wired for: silent loop, drawdown breach, reconcile drift over threshold, Bybit error-rate spike, rate-limit near exhaustion, kill-switch toggle, unhandled loop exception.
+- [ ] Reconcile-drift counter per window; alert + write the drift detail to `v3_position_event`.
+- [ ] Bybit calls bucketed by `retCode`/timeout; rolling error-rate; read + act on rate-limit headers.
+- [ ] Latency captured around every signed REST call; order request→ack + fill-confirm logged (by `orderLinkId`).
+- [ ] Structured JSON logging with `loop` + `corrId` on every line; no secrets/raw key payloads.
+- [ ] `v3_decision_log` / `v3_position_event` capture the guards that fired and before/after state for full replay.
+- [ ] Hono `/health` reporting per-loop liveness + DB ping + Bybit reachability; `503` when critical loop stale/DB down.
+- [ ] (Optional/future) `/metrics` + Prometheus + Grafana as an add-on — documented, not required now.
 
 ## Do / Don't
 **Do**
-- Instrument the **outcome** of trading actions (fills, PnL, rejects), not just HTTP metrics.
-- Use histograms for latency and `histogram_quantile()` for p95/p99 across instances.
-- Add a heartbeat/dead-man's-switch per bot and alert on staleness — the #1 way to catch a stuck bot.
-- Alert on *rates* and *symptoms* (drawdown, no-fills, error-rate) with `for:` to avoid flapping.
-- Watch Bybit rate-limit headers and alert before exhaustion.
+- Give every loop a heartbeat and alert on staleness — the #1 way to catch a hung loop a liveness probe misses.
+- Use `v3_decision_log` / `v3_position_event` as the primary forensic record; make sure they capture *why* (guards) and *before/after*.
+- Alert on symptoms (silent loop, drawdown, reconcile drift, error-rate) with a cooldown to avoid flapping.
+- Watch Bybit rate-limit headers and throttle before exhaustion.
+- Thread a correlation id through each engine turn so its logs are reconstructable.
 
 **Don't**
-- Don't label metrics with unbounded values (order_id, price, timestamp) — cardinality explosion kills Prometheus.
-- Don't rely on process-up liveness to know a bot is trading — a hung async loop still "runs".
-- Don't page on everything; over-alerting causes fatigue and missed real incidents.
-- Don't log secrets/API keys or full order payloads with keys into your log pipeline.
-- Don't use client-side Summary quantiles when you need cross-instance aggregation — use Histogram.
+- Don't rely on process-up to know a loop is working — a stuck loop still "runs".
+- Don't send a Telegram message per raw error; batch/cooldown or you train operators to mute the channel.
+- Don't log secrets, API keys, full session tokens, or raw Bybit responses containing keys.
+- Don't treat missing metrics as an outage vs. a stale loop — distinguish "no data" from "bad data".
+- Don't build Prometheus/Grafana now if the ask is basic ops visibility — heartbeat + Telegram + audit tables suffice.
 
 ## Common pitfalls
-- **Silent WS stall**: TCP stays open but no messages arrive; only a `ws_last_message_timestamp` staleness check catches it.
-- **Default histogram buckets** are HTTP-shaped and hide sub-100ms order latency — define your own.
-- **Cardinality bombs** from per-symbol × per-side × per-bot × per-retCode labels — budget your dimensions.
-- **Flapping alerts** without a `for:` pending period spam the channel and get muted.
-- **Scrape gap = fake outage**: if the bot's metrics port dies you lose visibility; pair metric alerts with an `up == 0` / `absent()` alert.
-- **Multiprocess metrics** double-counting or missing when `PROMETHEUS_MULTIPROC_DIR` isn't set under multiple workers.
-- **Clock-based heartbeat** breaks if bot and Prometheus clocks drift — keep hosts NTP-synced.
+- **Silent loop, healthy container**: the process is up, the engine loop is wedged on a hung `fetch`; only a last-tick staleness check catches it — add per-call timeouts.
+- **No cooldown → alert spam**: a flapping condition floods Telegram, operators mute it, the real alert is missed.
+- **Reconcile drift ignored**: treating drift corrections as routine hides a systematic ledger-vs-exchange bug or a missed fill.
+- **Untracked timeouts**: a polling REST call with no timeout blocks the whole loop; count and bound them.
+- **Clock drift**: heartbeat ages and Bybit `recvWindow` both depend on a correct clock — keep the container NTP-synced.
+- **Audit gaps**: logging the decision but not the guards/outcome, so `v3_decision_log` can't explain an incident.
+- **`/health` too shallow**: returning `200` just because the HTTP server answers, while a critical loop is dead — include per-loop liveness.
+- **High-cardinality log fields** (raw prices, order ids in every line) bloat logs; keep structured fields bounded and put detail in the audit tables.
 
 ## Code patterns
-```python
-# Core trading metrics (prometheus_client) exposed on a per-bot port.
-from prometheus_client import Counter, Gauge, Histogram, start_http_server
-import time
+```typescript
+// Per-loop heartbeat + a single watchdog that Telegram-alerts on staleness (dead-man's switch).
+type LoopName = "collector" | "v3engine" | "optimizer" | "calendar" | "news";
+const lastTick = new Map<LoopName, number>();
+export const beat = (loop: LoopName) => lastTick.set(loop, Date.now());
 
-ORDER_LATENCY = Histogram("order_submit_latency_seconds",
-    "Signal->ack latency", ["symbol", "side"],
-    buckets=(.01, .025, .05, .1, .25, .5, 1, 2.5, 5))
-ORDERS   = Counter("orders_total", "Orders by result", ["result"])   # ok|reject|error
-WS_DROPS = Counter("ws_disconnects_total", "WS reconnects", ["stream"])
-UPNL     = Gauge("unrealized_pnl", "Unrealized PnL (USDT)")
-HEARTBEAT= Gauge("bot_last_loop_timestamp", "Epoch of last loop", ["bot_id"])
-
-start_http_server(9101)                       # Prometheus scrapes :9101/metrics
-
-def trade_loop(bot_id, bybit):
-    while True:
-        with ORDER_LATENCY.labels("BTCUSDT", "Buy").time():
-            r = bybit.place_order(category="linear", symbol="BTCUSDT",
-                                  side="Buy", orderType="Market", qty="0.001",
-                                  orderLinkId=new_id())
-        ORDERS.labels("ok" if r["retCode"] == 0 else "reject").inc()
-        HEARTBEAT.labels(bot_id).set(time.time())   # dead-man's switch
+const MAX_AGE_MS: Record<LoopName, number> = {
+  collector: 60_000, v3engine: 30_000, optimizer: 3 * 3600_000,
+  calendar: 20 * 60_000, news: 5 * 60_000,
+};
+setInterval(() => {
+  const now = Date.now();
+  for (const [loop, ceiling] of Object.entries(MAX_AGE_MS) as [LoopName, number][]) {
+    const age = now - (lastTick.get(loop) ?? 0);
+    if (age > ceiling) alert("critical", `Loop ${loop} silent for ${(age / 1000) | 0}s`);
+  }
+}, 15_000);
 ```
 
-```yaml
-# Prometheus alert rules — stuck bot, drawdown, WS storm, down target.
-groups:
-- name: trading
-  rules:
-  - alert: BotHeartbeatStale
-    expr: time() - bot_last_loop_timestamp > 60
-    for: 1m
-    labels: {severity: critical}
-    annotations: {summary: "Bot {{ $labels.bot_id }} silent >60s"}
-  - alert: DrawdownBreach
-    expr: (max_over_time(account_equity[1d]) - account_equity)
-          / max_over_time(account_equity[1d]) > 0.10
-    for: 2m
-    labels: {severity: critical}
-    annotations: {summary: "Intraday drawdown >10%"}
-  - alert: WSDisconnectStorm
-    expr: increase(ws_disconnects_total[5m]) > 3
-    for: 0m
-    labels: {severity: warning}
-  - alert: MetricsTargetDown
-    expr: up{job="bots"} == 0
-    for: 1m
-    labels: {severity: critical}
+```typescript
+// Telegram alert helper with per-key cooldown so a flapping condition can't spam the channel.
+const lastSent = new Map<string, number>();
+export async function alert(sev: "info" | "warn" | "critical", text: string, cooldownMs = 300_000) {
+  const key = `${sev}:${text}`;
+  if (Date.now() - (lastSent.get(key) ?? 0) < cooldownMs) return;
+  lastSent.set(key, Date.now());
+  const emoji = { info: "ℹ️", warn: "⚠️", critical: "🚨" }[sev];
+  await fetch(`https://api.telegram.org/bot${process.env.TG_TOKEN}/sendMessage`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chat_id: process.env.TG_CHAT, parse_mode: "HTML",
+                           text: `${emoji} <b>${sev}</b>: ${text}` }),
+  });
+}
 ```
 
-```python
-# structlog JSON logs bound with correlation + OTel trace id.
-import structlog
-structlog.configure(processors=[
-    structlog.contextvars.merge_contextvars,
-    structlog.processors.add_log_level,
-    structlog.processors.TimeStamper(fmt="iso", utc=True),
-    structlog.processors.JSONRenderer(),
-])
-log = structlog.get_logger()
-structlog.contextvars.bind_contextvars(bot_id="bot-42", request_id=req_id)
-log.info("order.submitted", symbol="BTCUSDT", qty=0.001, order_link_id=oid)
+```typescript
+// Instrumented signed REST call: latency, retCode bucketing, timeout, structured log.
+async function bybitCall(fn: () => Promise<Response>, ctx: { loop: string; corrId: string }) {
+  const t0 = Date.now();
+  const res = await Promise.race([fn(),
+    new Promise<Response>((_, rej) => setTimeout(() => rej(new Error("timeout")), 8000))]);
+  const body = await res.json() as { retCode: number };
+  const ms = Date.now() - t0;
+  log({ level: body.retCode === 0 ? "info" : "warn", loop: ctx.loop, corrId: ctx.corrId,
+        event: "bybit.call", retCode: body.retCode, ms });
+  if (body.retCode === 10006) alert("warn", "Bybit rate limit (10006)"); // rate limit hit
+  return body;
+}
+const log = (o: Record<string, unknown>) =>
+  console.log(JSON.stringify({ ts: new Date().toISOString(), ...o })); // one JSON line per event
+```
+
+```typescript
+// Hono /health: per-loop liveness + DB + Bybit reachability. 503 if a critical loop is stale.
+app.get("/health", async (c) => {
+  const now = Date.now();
+  const loops = Object.fromEntries(
+    [...lastTick].map(([l, ts]) => [l, { ageMs: now - ts, stale: now - ts > MAX_AGE_MS[l] }]));
+  const dbOk = await db.execute(sql`select 1`).then(() => true).catch(() => false);
+  const bybitOk = await fetch("https://api.bybit.com/v5/market/time")
+    .then((r) => r.ok).catch(() => false);
+  const healthy = dbOk && !Object.values(loops).some((l) => l.stale && l.critical);
+  return c.json({ ok: healthy, loops, dbOk, bybitOk }, healthy ? 200 : 503);
+});
 ```
 
 ## References
-- [Prometheus Python client (GitHub)](https://github.com/prometheus/client_python) — Counter/Gauge/Histogram, `start_http_server`, multiprocess mode.
-- [Prometheus — Metric types](https://prometheus.io/docs/concepts/metric_types/) — when to use counter vs gauge vs histogram.
-- [Prometheus — Alerting rules](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/) — `expr`, `for`, labels/annotations.
-- [prometheus-fastapi-instrumentator (GitHub)](https://github.com/trallnag/prometheus-fastapi-instrumentator) — auto-instrument FastAPI, custom metrics.
-- [Grafana — Configure Alertmanager](https://grafana.com/docs/grafana/latest/alerting/set-up/configure-alertmanager/) — routing/grouping and Alertmanager hand-off.
-- [Grafana — Alert rules](https://grafana.com/docs/grafana/latest/alerting/fundamentals/alert-rules/) — building rules, evaluation, pending periods.
-- [OpenTelemetry Python](https://opentelemetry.io/docs/languages/python/) — SDK setup, exporters, auto-instrumentation.
-- [OpenTelemetry Python — Instrumentation](https://opentelemetry.io/docs/languages/python/instrumentation/) — TracerProvider, spans, context propagation.
-- [structlog — Standard library integration](https://www.structlog.org/en/stable/standard-library.html) — JSON rendering, contextvars, processors.
-- [Google SRE — Service Level Objectives](https://sre.google/sre-book/service-level-objectives/) — SLI/SLO definitions.
-- [Google SRE — Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/) — multi-window burn-rate alerting.
-- [Google SRE — Error Budget Policy](https://sre.google/workbook/error-budget-policy/) — using error budgets to gate releases.
-- [Bybit V5 — WebSocket connect](https://bybit-exchange.github.io/docs/v5/ws/connect) — heartbeat/ping, reconnect, public vs private streams.
+- [Telegram Bot API](https://core.telegram.org/bots/api#sendmessage) — `sendMessage`, `chat_id`/`text`/`parse_mode`, rate limits.
+- [Bybit V5 — Integration Guidance](https://bybit-exchange.github.io/docs/v5/guide) — rate-limit headers (`X-Bapi-Limit-Status`), `retCode`s, timestamp/`recvWindow`.
+- [Bybit V5 — Introduction](https://bybit-exchange.github.io/docs/v5/intro) — REST base URLs, server-time endpoint for reachability checks.
+- [Hono](https://hono.dev/docs) — routing/middleware for the `/health` endpoint on Bun.
+- [Bun — Test/runtime docs](https://bun.com/docs) — `setInterval`, `fetch`, and Node-compatible APIs used by the loops/watchdog.
+- [pino — Node/Bun JSON logger](https://getpino.io/) — fast structured logging with bindings/correlation fields.
+- [Drizzle ORM — MySQL](https://orm.drizzle.team/docs/mysql/get-started-mysql) — DB access for heartbeat/audit tables and the `/health` ping.
+- [Google SRE — Service Level Objectives](https://sre.google/sre-book/service-level-objectives/) — framing symptom-based alerting and what to measure.
+- [Prometheus — Metric types](https://prometheus.io/docs/concepts/metric_types/) — OPTIONAL future add-on if `/metrics` scraping is introduced.
+- [Grafana — Alert rules](https://grafana.com/docs/grafana/latest/alerting/fundamentals/alert-rules/) — OPTIONAL future dashboards/alerting, not the current setup.

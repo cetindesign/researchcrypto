@@ -1,148 +1,165 @@
 ---
 name: portfolio-management
-description: Managing capital across multiple bots/strategies on Bybit — capital allocation and weighting, rebalancing, equity-curve and PnL accounting (realized vs unrealized, trading fees, funding fees), aggregating positions across bots on one account vs isolating them in sub-accounts, diversification and correlation, and tracking per-strategy performance (Sharpe, drawdown, PnL attribution). Use when the task involves allocating capital between strategies, "how much to give each bot", rebalancing, portfolio equity/PnL accounting, realized vs unrealized PnL, funding/fee accounting, netting or aggregating positions across bots, Bybit sub-accounts, diversification, or per-strategy performance metrics.
+description: Managing capital across many bots/users on Bybit in this TypeScript platform — slot-based capital allocation, layering (katman), realized/unrealized PnL with explicit fee and funding accounting stored in MySQL via Drizzle, reconciling the DB ledger against real exchange positions (exchange = truth), per-user configs, and per-strategy/per-slot performance attribution (PnL, drawdown, win rate, Sharpe). Use when the task involves allocating capital to slots, "how much per bot", layering/adding to a position, building the PnL ledger, booking trading fees or funding, reconciling DB vs Bybit positions, per-user allocation, closed vs unrealized PnL, equity snapshots, or attributing performance to a strategy/slot. DB is the accounting ledger; the exchange is the source of truth.
 ---
 
-# Portfolio Management (Multi-Bot on Bybit)
+# Portfolio Management (Multi-Bot / Multi-User on Bybit, TypeScript)
 
 ## When to use this skill
-- Deciding capital allocation / weights across multiple bots or strategies.
-- Building an equity curve or PnL ledger (realized vs unrealized, fees, funding).
-- Reconciling account balance with the sum of per-bot positions.
-- Choosing single account vs sub-accounts for isolating strategies.
-- Rebalancing allocations on a schedule or on drift/performance triggers.
-- Measuring per-strategy Sharpe, drawdown, win rate, or PnL attribution.
+- Allocating capital across slots/users, or deciding how much a bot gets.
+- Handling layering (katman) — adding to an open position within a slot's caps.
+- Building the PnL ledger: realized vs unrealized, trading fees, funding.
+- Reconciling the Drizzle/MySQL ledger against real Bybit positions.
+- Snapshotting equity and computing per-slot/per-strategy performance metrics.
+- Storing/reading per-user configs that drive allocation and attribution.
 
 ## Core concepts
 
-**Capital allocation.** Split total equity `E` into per-strategy budgets `w_i * E` (`Σ w_i ≤ 1`, keep a cash buffer for margin spikes and funding). Common schemes:
-- **Equal-weight** — simple, robust baseline; hard to beat out-of-sample.
-- **Risk-parity / inverse-vol** — `w_i ∝ 1/σ_i` so each strategy contributes similar risk.
-- **Performance / Sharpe-weighted** — tilt toward strategies with higher risk-adjusted returns; cap max weight to avoid overfitting to recent luck.
-- **Mean-variance (Markowitz)** — maximize return per unit variance using expected returns, vols, and the correlation matrix; the efficient frontier is the set of optimal risk/return portfolios. Powerful but unstable: tiny input errors produce extreme weights — regularize, add weight caps, or shrink the covariance matrix.
+**Slot-based allocation.** Capital is divided into **slots** — the platform's unit of allocation. Each slot holds at most one position at a time and carries a budget (a notional cap and/or a fraction of the user's equity). The allocator decides which candidate coin fills a free slot; the number of slots and their budgets are per-user config. Keep a cash buffer (never allocate 100%) for margin spikes and funding. Common weighting: equal-weight slots (robust default), or size slots by inverse realized volatility / recent risk-adjusted performance with a per-slot cap to avoid chasing luck.
 
-**Diversification & correlation.** Diversification benefit comes from combining *imperfectly correlated* return streams; it is driven by covariance, not the number of bots. Two strategies with correlation < 1 have combined variance below the weighted average. In crypto, most directional long strategies collapse to BTC-beta in a selloff (correlations → 1), so measure realized *strategy-return* correlation, not just which symbols they trade.
+**Layering (katman).** Within a slot, the strategy may **add to** the position (average in) at defined thresholds. Portfolio-side rules: cap the number of layers and the aggregate slot notional (risk-management owns the hard caps), and track the true blended `avgPrice` and total size per slot so PnL and exposure stay correct after each add.
 
-**Equity curve.** Time series of account equity = `wallet balance + Σ unrealized PnL`. Foundation for drawdown, Sharpe, and allocation decisions. Snapshot on a fixed cadence (e.g. every minute + on every fill) so metrics are comparable.
+**Equity & snapshots.** Account equity = wallet balance + Σ unrealized PnL (Bybit's `totalEquity` already includes unrealized — don't add notional on top). Snapshot equity on a fixed cadence and on every fill/close so drawdown, Sharpe, and allocation decisions use comparable series. Store snapshots in MySQL.
 
-**PnL accounting.**
+**PnL accounting (book fees and funding explicitly).**
 - **Realized PnL** = closed-trade PnL − open fee − close fee − Σ funding paid/received. It is *net* of costs.
-- **Unrealized PnL** = mark-to-market on open positions; does **not** include the fees/funding you'll still incur.
-- **Trading fees** = taker/maker fee × notional, per fill (and partial fills each incur fees).
-- **Funding fees** = `position_value × funding_rate`, exchanged between longs and shorts every funding interval (8h on Bybit majors) *only if you hold at the funding timestamp*. Positive rate → longs pay shorts. High-turnover and carry strategies live or die on fees+funding — always book them.
+- **Unrealized PnL** = mark-to-market on open positions; does **not** include the fees/funding you'll still pay.
+- **Trading fees** = taker/maker rate × notional, per fill (every partial fill and every layer add incurs a fee).
+- **Funding** = `positionValue × fundingRate`, exchanged between longs/shorts every funding interval (8h on Bybit majors, 00:00/08:00/16:00 UTC) **only if you hold at the funding timestamp**. Positive rate → longs pay shorts. High-turnover and carry slots live or die on fees+funding — always book them.
 
-**Sharpe ratio.** Excess return per unit of volatility: `(mean(returns) − rf) / std(returns)`, annualized by `√periods_per_year`. Primary cross-strategy comparison metric; report alongside max drawdown and Calmar.
+**DB = ledger, exchange = truth (reconcile).** The MySQL tables are your **accounting ledger**; the **exchange is the single source of truth** for what positions actually exist. Every engine tick fetches real positions from Bybit and **reconciles**: if the DB says a slot is open but Bybit shows flat (e.g. a manual close or a missed close), correct the DB and book the realized PnL from Bybit's closed-PnL record — never let the ledger silently diverge. Reconstruct the authoritative money trail from Bybit's transaction log (which includes funding settlements), not from your own guesses.
 
-**Position aggregation: one account vs sub-accounts.**
-- **One (unified) account, many bots:** Bybit nets same-symbol positions in one-way mode — two bots long BTCUSDT share a single net position and one liquidation price, so you *cannot* cleanly attribute PnL or risk per bot from the exchange. You must track each bot's intended position internally and reconcile against the netted exchange position. Shared cross margin also means one bot's loss can liquidate another's.
-- **Sub-accounts (one per bot/strategy):** each gets its own balance, positions, margin, liquidation, and API key — clean isolation, clean per-strategy accounting, contained blast radius. Cost: capital is siloed (must transfer to rebalance), and you manage N key sets. Bybit allows up to ~20 standard sub-accounts; the master can 2-way transfer between itself and any sub (and between subs), fee-free; standard subs can only transfer back to master.
+**Per-user configs.** Each user has slots count, budgets, risk fractions, allowed coins, and guard settings — read from the DB. Allocation and attribution are always scoped per user; two users' slots are independent capital pools.
 
-**Rebalancing.** Realign actual weights to targets when they drift past a band (e.g. ±5–10 absolute %) or on a schedule, or reallocate based on rolling performance. Trade off tracking error vs transaction/funding costs — over-frequent rebalancing bleeds fees; too infrequent lets a hot strategy dominate risk.
+**Per-strategy / per-slot attribution.** Attribute realized PnL, fees, funding, drawdown, win rate, and Sharpe to the slot and strategy that produced them. Because one Bybit account nets same-symbol positions in one-way mode, you **cannot** read per-slot PnL off the exchange — you must attribute internally from `v3_position_event` / closed-PnL records keyed by slot, and reconcile the *sum* against the exchange net position.
 
-## Bybit / Python specifics
+**Sharpe & metrics.** Sharpe = `(mean(returns) − rf) / std(returns)`, annualized by `√periodsPerYear`. Report alongside max drawdown and Calmar; compare strategies on risk-adjusted terms, not raw PnL.
 
-**Read total portfolio state (pybit).**
-```python
-from pybit.unified_trading import HTTP
-s = HTTP(api_key=..., api_secret=..., testnet=False)
-w = s.get_wallet_balance(accountType="UNIFIED")["result"]["list"][0]
-equity = float(w["totalEquity"])          # balance + unrealized PnL
-# per-coin: w["coin"][i]["walletBalance"], "unrealisedPnl", "cumRealisedPnl"
+## Codebase specifics (Bybit / Drizzle / this platform)
+
+**Ledger tables (Drizzle, MySQL).** Schema is guaranteed by an idempotent `ensure-schema.ts` (ALTER TABLE), not migration files. Store money as `decimal`, never float:
+```ts
+import { mysqlTable, bigint, varchar, decimal, timestamp, int } from "drizzle-orm/mysql-core";
+
+export const slotState = mysqlTable("v3_slot_state", {
+  id: bigint("id", { mode: "number" }).primaryKey().autoincrement(),
+  userId: varchar("user_id", { length: 64 }).notNull(),
+  slotId: int("slot_id").notNull(),
+  symbol: varchar("symbol", { length: 32 }),
+  side: varchar("side", { length: 8 }),
+  size: decimal("size", { precision: 38, scale: 12 }),
+  avgPrice: decimal("avg_price", { precision: 38, scale: 12 }),
+  layers: int("layers").notNull().default(0),
+  updatedAt: timestamp("updated_at").defaultNow().onUpdateNow(),
+});
+
+export const pnlLedger = mysqlTable("v3_pnl_ledger", {
+  id: bigint("id", { mode: "number" }).primaryKey().autoincrement(),
+  userId: varchar("user_id", { length: 64 }).notNull(),
+  slotId: int("slot_id").notNull(),
+  kind: varchar("kind", { length: 16 }).notNull(), // 'trade' | 'fee' | 'funding'
+  amount: decimal("amount", { precision: 38, scale: 12 }).notNull(),
+  createdAt: timestamp("created_at").defaultNow(),
+});
 ```
 
-**Realized PnL & fees history** (essential for a correct ledger):
-```python
-s.get_closed_pnl(category="linear", symbol="BTCUSDT", limit=100)
-#   -> closedPnl, openFee, closeFee, cumEntryValue, cumExitValue, leverage
-s.get_transaction_log(accountType="UNIFIED", category="linear")
-#   -> unified ledger: TRADE, SETTLEMENT (funding), FEE, TRANSFER, funding, fee, change
-```
-`get_closed_pnl` gives per-trade net PnL; `get_transaction_log` is the authoritative running ledger including **funding settlements** — reconcile your internal books against it.
+**Read real state from Bybit (signed REST, no WebSocket).** Sign with `crypto.createHmac` + X-BAPI headers (see risk-management / rest-polling skills). Authoritative endpoints for the ledger:
+- `GET /v5/account/wallet-balance` (UNIFIED) → `totalEquity` for equity snapshots.
+- `GET /v5/position/list` → live positions to reconcile the ledger against.
+- `GET /v5/position/closed-pnl` → per-trade `closedPnl`, `openFee`, `closeFee` for realized PnL.
+- `GET /v5/account/transaction-log` → the authoritative running ledger including **funding settlements**.
 
-**Sub-account management (master API key needs Account/Subaccount Transfer perms).**
-```python
-s.create_sub_member(username="bot_momentum", memberType=1)        # POST /v5/user/create-sub-member
-s.create_sub_api_key(subuid=SUBUID, readOnly=0,
-                     permissions={"ContractTrade": ["Order","Position"]})
-s.create_universal_transfer(coin="USDT", amount="1000",
-    fromMemberId=MASTER, toMemberId=SUBUID,
-    fromAccountType="UNIFIED", toAccountType="UNIFIED")  # rebalance capital
+**Write the ledger in a transaction.** Book the trade, its fees, and any funding atomically so a crash never half-writes:
+```ts
+await db.transaction(async (tx) => {
+  await tx.insert(pnlLedger).values([
+    { userId, slotId, kind: "trade",   amount: closedPnl },
+    { userId, slotId, kind: "fee",     amount: negate(openFee + closeFee) },
+  ]);
+  await tx.update(slotState).set({ symbol: null, side: null, size: "0", layers: 0 })
+          .where(and(eq(slotState.userId, userId), eq(slotState.slotId, slotId)));
+});
 ```
-
-**Fee/funding rates:** taker/maker via `get_fee_rates`; upcoming and historical funding via `get_funding_rate_history(category="linear", symbol=...)`. Bybit majors fund every 8h (00:00/08:00/16:00 UTC).
 
 ## Implementation checklist
-- [ ] Choose isolation model up front: unified account (cheaper capital, messy attribution) vs sub-account-per-bot (clean attribution, siloed capital). Prefer sub-accounts when per-strategy accounting matters.
-- [ ] Central allocator computes target weights (`Σ ≤ 1`, cash buffer reserved) and per-bot budgets.
-- [ ] Persist an equity snapshot on a fixed cadence + on every fill/funding event.
-- [ ] Build a PnL ledger from `get_closed_pnl` + `get_transaction_log`; book fees and funding explicitly.
-- [ ] Reconcile: `Σ per-bot intended positions == exchange net position` (unified) or per-sub position (sub-accounts). Alert on drift.
-- [ ] Compute per-strategy Sharpe, max drawdown, Calmar, win rate, turnover from the equity/PnL series.
-- [ ] Maintain a rolling strategy-return correlation matrix; cap aggregate exposure per cluster.
-- [ ] Rebalance on drift bands or schedule; simulate the fee/funding cost of the rebalance before executing.
+- [ ] Define slots per user (count + budget) in config; keep a cash buffer; enforce per-slot notional caps.
+- [ ] Track blended `avgPrice`, `size`, and `layers` per slot; update on every layer add.
+- [ ] Snapshot equity (`totalEquity`) on a fixed cadence + on every fill/close.
+- [ ] Build the PnL ledger from `closed-pnl` + `transaction-log`; book trade, fee, and funding rows explicitly.
+- [ ] Reconcile every tick: DB slot state vs Bybit `position/list`; correct the DB to match the exchange and book any missed realized PnL.
+- [ ] Attribute PnL/fees/funding/drawdown/Sharpe per slot and per strategy from `v3_position_event`.
+- [ ] Store money as `decimal(38,12)`; never float.
+- [ ] Write related ledger + slot updates inside a Drizzle `db.transaction`.
 
 ## Do / Don't
 **Do**
-- Book fees and funding into realized PnL — unrealized PnL flatters you by omitting them.
-- Reconcile internal per-bot books against Bybit's transaction log every cycle.
-- Use sub-accounts to get clean, per-strategy risk and PnL isolation.
-- Keep a cash/margin buffer; don't allocate 100% into strategy budgets.
-- Compare strategies on risk-adjusted terms (Sharpe/Calmar), not raw PnL.
+- Book fees and funding into realized PnL — unrealized flatters you by omitting them.
+- Treat the exchange as truth: reconcile the DB ledger to `position/list` every tick.
+- Reconstruct the money trail from Bybit's transaction log (it has funding settlements).
+- Keep a cash/margin buffer; don't allocate 100% of equity into slots.
+- Attribute per slot internally; compare strategies on Sharpe/Calmar, not raw PnL.
 
 **Don't**
-- Don't run two bots on the same symbol in one one-way account expecting independent positions — Bybit nets them.
-- Don't trust mean-variance weights without caps/shrinkage — they explode on noisy inputs.
-- Don't rebalance so often that fees/funding eat the benefit.
-- Don't treat "many bots" as diversification when their returns are correlated.
-- Don't attribute a netted position's PnL to one bot without an internal allocation model.
+- Don't run two slots on the same symbol in one one-way account expecting independent positions — Bybit nets them; attribute internally.
+- Don't double-count equity by adding notional to `totalEquity` (it already includes unrealized PnL).
+- Don't store prices/PnL as float — use `decimal`.
+- Don't let the ledger diverge from the exchange because a close was missed — reconcile and correct.
+- Don't call "many slots" diversification when their returns are correlated to BTC.
 
 ## Common pitfalls
-- **Funding blind spot:** ignoring funding makes carry/high-turnover strategies look profitable when they aren't.
-- **Netting confusion:** same-symbol positions across bots merge in one-way mode; hedge mode has separate long/short legs but still one account.
-- **Double-counting equity:** summing wallet balance *and* position value inflates equity — equity already includes unrealized PnL, not notional.
-- **Survivorship in performance weighting:** allocating to recent winners chases noise and raises correlation to a single regime.
-- **Covariance instability:** Markowitz optima flip sign with small estimation changes; regularize.
-- **Sub-account transfer latency/limits:** rebalancing between subs is a real transfer with its own constraints — not instant free capital movement mid-trade.
-- **Timezone mismatch** between funding settlement (UTC) and your PnL day boundary.
+- **Funding blind spot:** ignoring funding makes carry/high-turnover slots look profitable when they aren't.
+- **Netting confusion:** same-symbol slots merge into one net position on the exchange; per-slot PnL must come from your internal ledger.
+- **Ledger drift:** a manual close or missed close on Bybit leaves the DB thinking a slot is open — every tick's reconcile is what catches it.
+- **Double-counted equity:** summing wallet balance and position value inflates equity.
+- **Float rounding:** `float`/`double` corrupt PnL and fee sums; `decimal` is exact.
+- **Timezone mismatch:** funding settles in UTC; a local-time PnL day boundary mis-books it.
+- **Survivorship in weighting:** tilting allocation to recent winners chases noise and raises regime correlation.
 
 ## Code patterns
 
-Inverse-volatility (risk-parity-lite) allocation with a weight cap:
-```python
-import numpy as np
-def inverse_vol_weights(vols, w_cap=0.4, cash_buffer=0.1):
-    inv = 1.0 / np.asarray(vols, float)
-    w = inv / inv.sum()
-    w = np.minimum(w, w_cap)
-    w = w / w.sum() * (1 - cash_buffer)   # keep buffer as cash
-    return w                              # per-strategy fraction of equity
+Inverse-volatility slot weights with a cap and cash buffer (pure):
+```ts
+export function inverseVolWeights(vols: number[], wCap = 0.4, cashBuffer = 0.1): number[] {
+  const inv = vols.map((v) => 1 / v);
+  const sum = inv.reduce((a, b) => a + b, 0);
+  let w = inv.map((x) => Math.min(x / sum, wCap));
+  const s = w.reduce((a, b) => a + b, 0);
+  return w.map((x) => (x / s) * (1 - cashBuffer)); // fraction of equity per slot
+}
 ```
 
-Annualized Sharpe from an equity curve:
-```python
-import numpy as np
-def sharpe(equity, periods_per_year=365*24, rf=0.0):
-    eq = np.asarray(equity, float)
-    r = np.diff(eq) / eq[:-1]
-    ex = r - rf / periods_per_year
-    sd = ex.std(ddof=1)
-    return 0.0 if sd == 0 else ex.mean() / sd * np.sqrt(periods_per_year)
+Annualized Sharpe from an equity snapshot series (pure):
+```ts
+export function sharpe(equity: number[], periodsPerYear = 365 * 24, rf = 0): number {
+  const r: number[] = [];
+  for (let i = 1; i < equity.length; i++) r.push((equity[i] - equity[i - 1]) / equity[i - 1]);
+  const ex = r.map((x) => x - rf / periodsPerYear);
+  const mean = ex.reduce((a, b) => a + b, 0) / ex.length;
+  const sd = Math.sqrt(ex.reduce((a, b) => a + (b - mean) ** 2, 0) / (ex.length - 1));
+  return sd === 0 ? 0 : (mean / sd) * Math.sqrt(periodsPerYear);
+}
 ```
 
-Rebalance only when a weight drifts outside its band:
-```python
-def needs_rebalance(current, target, band=0.05):
-    return any(abs(c - t) > band for c, t in zip(current, target))
+Reconcile DB slot state against the exchange (dirty shell calls a pure diff):
+```ts
+export function reconcileSlot(
+  dbOpen: boolean, exchangeSize: number,
+): "book_close" | "adopt_open" | "ok" {
+  if (dbOpen && exchangeSize === 0) return "book_close"; // closed on exchange, DB stale
+  if (!dbOpen && exchangeSize !== 0) return "adopt_open"; // exists on exchange, DB missed it
+  return "ok";
+}
 ```
 
 ## References
-- [Bybit V5 — Create Sub UID](https://bybit-exchange.github.io/docs/v5/user/create-subuid) — programmatic sub-account creation for per-bot isolation.
-- [Bybit V5 — Create Sub UID API Key](https://bybit-exchange.github.io/docs/v5/user/create-subuid-apikey) — scoped API keys per sub-account.
-- [Bybit — FAQ: Standard Subaccount](https://www.bybit.com/en/help-center/article/FAQ-Standard-Subaccount) — transfer rules, limits (~20 subs), fee-free master↔sub transfers.
+- [Bybit V5 — Get Wallet Balance](https://bybit-exchange.github.io/docs/v5/account/wallet-balance) — totalEquity for equity snapshots (balance + unrealized PnL).
+- [Bybit V5 — Get Position Info](https://bybit-exchange.github.io/docs/v5/position/position-list) — live positions to reconcile the ledger against (exchange = truth).
+- [Bybit V5 — Get Closed PnL](https://bybit-exchange.github.io/docs/v5/position/close-pnl) — per-trade closedPnl, openFee, closeFee for realized PnL.
+- [Bybit V5 — Get Transaction Log](https://bybit-exchange.github.io/docs/v5/account/transaction-log) — authoritative ledger including funding settlements.
 - [Bybit — P&L Calculations (USDT Perpetual & Expiry)](https://www.bybit.com/en/help-center/article/Profit-Loss-calculations-USDT-Contract) — realized vs unrealized PnL formulas.
-- [Bybit — Funding Fee Calculation](https://www.bybit.com/en/help-center/article/Funding-fee-calculation) — position_value × funding_rate, settlement timing.
-- [Bybit — Introduction to Funding Rate](https://www.bybit.com/en/help-center/article/Introduction-to-Funding-Rate) — who pays whom and the 8h interval.
-- [Bybit — Why Closed P&L is a Loss When Unrealized Was Positive](https://www.bybit.com/en/help-center/article/Why-Closed-PL-Loss-When-Unrealized-Profit-Positive) — fees/funding gap between unrealized and realized.
-- [Modern Portfolio Theory (Corporate Finance Institute)](https://corporatefinanceinstitute.com/resources/career-map/sell-side/capital-markets/modern-portfolio-theory-mpt/) — mean-variance, diversification, efficient frontier.
-- [Portfolio Optimization Book — Modern Portfolio Theory (Ch.7 slides)](https://portfoliooptimizationbook.com/slides/slides-modern-portfolio-theory.pdf) — formal mean-variance and covariance treatment.
-- [pybit — Official Bybit Python SDK](https://github.com/bybit-exchange/pybit) — get_wallet_balance, get_closed_pnl, get_transaction_log, transfers.
+- [Bybit — Funding Fee Calculation](https://www.bybit.com/en/help-center/article/Funding-fee-calculation) — positionValue × fundingRate, 8h settlement timing.
+- [Bybit — Introduction to Funding Rate](https://www.bybit.com/en/help-center/article/Introduction-to-Funding-Rate) — who pays whom and the interval.
+- [Drizzle ORM — MySQL column types](https://orm.drizzle.team/docs/column-types/mysql) — decimal/timestamp columns for money and snapshots.
+- [Drizzle ORM — Transactions](https://orm.drizzle.team/docs/transactions) — db.transaction() for atomic ledger + slot writes.
+- [Zod — Defining schemas](https://zod.dev/api) — validate per-user allocation config at the tRPC boundary.
+</content>

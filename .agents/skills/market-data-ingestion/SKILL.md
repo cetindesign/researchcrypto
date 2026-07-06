@@ -1,140 +1,162 @@
 ---
 name: market-data-ingestion
-description: How to fetch and normalize Bybit V5 market data in Python — OHLCV/kline (intervals, response array order, reverse-chronological sort, 1000-row limit, start/end pagination), orderbook snapshots, recent public trades, funding-rate history, open interest, and tickers — plus timestamp handling in milliseconds, detecting and backfilling missing candles/gaps, deduplicating on close time, storing normalized records, and choosing REST vs WebSocket. Invoke when the user mentions kline, OHLCV, candles, historical data backfill, funding rate, open interest, orderbook snapshot, recent trades, pagination of market data, candle gaps, timestamp/ms conversion, or normalizing/storing market data for backtests or indicators.
+description: How to fetch and normalize Bybit V5 market data via POLLING REST in TypeScript/Bun for this platform — kline/OHLCV (positional arrays, newest-first, 1000-row limit, ms timestamps, start/end backward pagination), tickers, orderbook snapshots, funding-rate history, and open interest — plus the `collector` loop that takes periodic price snapshots, normalizing string numerics, deduping on candle close/open time, detecting and backfilling gaps, and upserting rows into MySQL with Drizzle (`onDuplicateKeyUpdate`). There is NO WebSocket — everything is periodic `fetch`. Invoke when the user mentions kline, OHLCV, candles, backfill, funding rate, open interest, orderbook snapshot, tickers, pagination, candle gaps, ms timestamps, the collector/price snapshot loop, or normalizing/storing Bybit market data via Drizzle.
 ---
 
-# Market Data Ingestion (Bybit V5, Python)
+# Market Data Ingestion (Bybit V5, TypeScript / Bun, polling)
 
 ## When to use this skill
-- Backfilling historical OHLCV/kline candles for indicators or backtests.
-- Pulling funding rate, open interest, orderbook snapshots, or recent trades.
-- Paginating past the 1000-row per-request limit over a long time range.
-- Converting Bybit millisecond timestamps and detecting missing candles/gaps.
-- Deciding REST (batch/history) vs WebSocket (live) for a data source.
-- Normalizing raw exchange payloads into a consistent stored schema.
+- Backfilling historical OHLCV/kline candles for indicators, the coin-selector, or the optimizer.
+- Pulling tickers, funding rate, open interest, or an orderbook snapshot over REST.
+- Paginating past the 1000-row per-request kline limit across a long time range.
+- Working on the `collector` loop that takes periodic price snapshots.
+- Converting Bybit millisecond timestamps and detecting/backfilling missing candles.
+- Normalizing raw string payloads and upserting them into MySQL through Drizzle.
 
 ## Core concepts
-Bybit market-data endpoints are **public** (no signing) under `/v5/market/*`. Every endpoint takes `category` (`spot`/`linear`/`inverse`/`option`) and returns the standard `{retCode, retMsg, result, time}` envelope. **All timestamps are Unix milliseconds** (13 digits) — never seconds.
+Bybit market-data endpoints are **public** (no signing) under `/v5/market/*`. Every endpoint takes `category` (`linear`/`spot`; this platform is linear-first) and returns the standard `{ retCode, retMsg, result, time }` envelope. **All timestamps are Unix milliseconds** (13 digits) — never seconds. Numeric fields come back as **strings** — cast explicitly.
 
-Two data-shape families:
-1. **Kline (OHLCV)** — returned as arrays (positional), newest-first.
-2. **Everything else** (trades, funding, OI, tickers) — arrays of JSON objects.
+Two data shapes:
+1. **Kline (OHLCV)** — positional arrays, **newest-first**.
+2. **Everything else** (tickers, funding, OI, orderbook) — arrays/objects of string fields.
 
-Ingestion generally means: **backfill history over REST**, then **switch to WebSocket for the live tail** (see the `realtime-websocket-streaming` skill), stitching the two so no candle is dropped or double-counted.
+**There is no WebSocket in this codebase.** Live data is obtained by *polling* on interval loops (see the `rest-polling-and-rate-limits` skill). Ingestion = poll REST → normalize → upsert into MySQL, idempotently, with gap detection and backfill.
 
-## Bybit / Python specifics
+## Codebase specifics (Bybit / Bun / Drizzle / this platform)
+- **Runtime is Bun, language is TypeScript (strict); use global `fetch`.** Market calls are public, so skip the HMAC/signing path (that's the `exchange-integration-bybit` skill, for private calls).
+- **The `collector` loop** starts on boot and takes **periodic price snapshots** (typically via `/v5/market/tickers`, which returns many symbols in one call — cheapest way to snapshot prices, funding, and OI at once). It normalizes and writes rows via Drizzle.
+- **Storage is MySQL + Drizzle**, schema guaranteed by an idempotent `ensure-schema.ts` (idempotent `ALTER TABLE`, **no migration files**). Inserts are **upserts** via `.onDuplicateKeyUpdate(...)` so re-runs/backfills are safe.
+- **Dedup key:** kline on `(symbol, interval, startTime)` where `startTime` is the candle **open** time; enforce it as a unique index so `onDuplicateKeyUpdate` no-ops or refreshes cleanly.
+- **Timeouts & rate limits** apply to every poll: wrap `fetch` in `AbortSignal.timeout(...)` and share a rate-limit budget across loops (see the `rest-polling-and-rate-limits` skill). Backfill loops especially must throttle to avoid a 403 IP ban.
 
 ### Kline — `GET /v5/market/kline`
-Params: `category`, `symbol`, `interval`, `start` (ms), `end` (ms), `limit` (max **1000**, default 200).
-Interval values: `1, 3, 5, 15, 30, 60, 120, 240, 360, 720` (minutes), `D`, `W`, `M`.
-Response `result.list` is an array of arrays, **sorted in reverse by start time (newest first)**:
+Params: `category`, `symbol`, `interval`, `start` (ms), `end` (ms), `limit` (max **1000**, default 200). Intervals: `1,3,5,15,30,60,120,240,360,720` (minutes), `D`, `W`, `M`. `result.list` is an array of arrays, **sorted newest-first**:
 ```
-[ startTime, openPrice, highPrice, lowPrice, closePrice, volume, turnover ]
+[ startTime, open, high, low, close, volume, turnover ]   // all strings
 ```
-- `startTime` is the candle's **open** time in ms.
-- All numeric fields are **strings** — cast explicitly.
-- The most recent candle is usually **still forming** (not closed); drop or flag it unless you want partial data.
-- Related variants: `/v5/market/mark-price-kline`, `/v5/market/index-price-kline`, `/v5/market/premium-index-price-kline` (same shape).
+- `startTime` is the candle **open** time (ms). A "1m" candle at `T` covers `[T, T+60000)`.
+- The most recent candle is usually **still forming** — drop or flag it for indicator/backtest inputs.
+- Same-shape variants: `/v5/market/mark-price-kline`, `/v5/market/index-price-kline`.
 
-**Pagination:** the window is bounded by count (≤1000) AND by `start`/`end`. To walk a long range, iterate: request a window, take the oldest `startTime` returned, set the next request's `end = oldestStart - 1`, and repeat until you pass your target `start` or get an empty list. Reverse each batch to ascending before appending. Note: **spot has no time-based pagination cursor** the way you might expect — rely on `start`/`end`/`limit` windowing for all categories.
-
-### Recent public trades — `GET /v5/market/recent-trade`
-Params `category`, `symbol`, `limit` (spot ≤60, others ≤1000). Returns recent prints only (not deep history): `execId`, `price`, `size`, `side`, `time` (ms), `isBlockTrade`. For full trade history use the private execution endpoint or a WS `publicTrade` capture.
-
-### Funding rate history — `GET /v5/market/funding/history`
-Params `category` (linear/inverse), `symbol`, `startTime`, `endTime`, `limit` (≤200). Returns `fundingRate` and `fundingRateTimestamp` (ms) per settlement. Funding **interval varies per symbol** (commonly 8h, some 1h/4h) — do not assume 8h. The current/next funding rate is on the ticker, not here.
-
-### Open interest — `GET /v5/market/open-interest`
-Params `category` (linear/inverse), `symbol`, `intervalTime` (`5min`,`15min`,`30min`,`1h`,`4h`,`1d`), `startTime`, `endTime`, `limit` (≤200), plus a `cursor` for pagination. Returns `openInterest` + `timestamp` (ms).
+**Backward pagination:** to walk a long range, request a window, take the **oldest** `startTime` returned, set the next `end = oldestStart - 1`, repeat until you pass your target `start` or get an empty list. Reverse each batch to ascending before upserting.
 
 ### Tickers — `GET /v5/market/tickers`
-Params `category`, optional `symbol`. One call returns a snapshot per symbol: `lastPrice`, `bid1Price`/`ask1Price`, `volume24h`, `turnover24h`, and for derivatives `fundingRate`, `nextFundingTime`, `openInterest`, `markPrice`, `indexPrice`. Cheapest way to get current funding & OI for many symbols at once.
+Params `category`, optional `symbol`. One call returns a snapshot per symbol: `lastPrice`, `bid1Price`/`ask1Price`, `volume24h`, `turnover24h`, and for `linear`: `fundingRate`, `nextFundingTime`, `openInterest`, `markPrice`, `indexPrice`. This is the `collector`'s workhorse.
+
+### Funding rate history — `GET /v5/market/funding/history`
+Params `category` (linear/inverse), `symbol`, `startTime`, `endTime`, `limit` (≤200). Returns `fundingRate` + `fundingRateTimestamp` (ms). Funding **interval varies per symbol** (often 8h, some 1h/4h) — don't assume 8h.
+
+### Open interest — `GET /v5/market/open-interest`
+Params `category`, `symbol`, `intervalTime` (`5min`,`15min`,`30min`,`1h`,`4h`,`1d`), `startTime`, `endTime`, `limit` (≤200), plus a `cursor`. Returns `openInterest` + `timestamp` (ms).
 
 ### Orderbook snapshot — `GET /v5/market/orderbook`
-Params `category`, `symbol`, `limit` (depth; e.g. spot ≤200, linear/inverse ≤500). Returns `b` (bids) and `a` (asks) as `[price, size]` string pairs, plus `u` (update id) and `seq`. This is a one-shot REST snapshot; for a maintained live book use the WebSocket delta stream.
-
-### pybit and CCXT
-```python
-from pybit.unified_trading import HTTP
-s = HTTP(testnet=False)
-kl = s.get_kline(category="linear", symbol="BTCUSDT", interval="1", limit=1000)
-fr = s.get_funding_rate_history(category="linear", symbol="BTCUSDT", limit=200)
-oi = s.get_open_interest(category="linear", symbol="BTCUSDT", intervalTime="1h")
-
-import ccxt
-ex = ccxt.bybit()
-# CCXT returns ms-normalized ascending OHLCV: [ts, o, h, l, c, v]
-rows = ex.fetch_ohlcv('BTC/USDT:USDT', '1m', since=None, limit=1000,
-                      params={'category': 'linear'})
-```
-CCXT's `fetch_ohlcv` normalizes to ascending order and numeric types, which removes the reverse-sort and string-cast chores — but you still handle pagination via `since` looping.
+Params `category`, `symbol`, `limit` (depth). Returns `b` (bids) and `a` (asks) as `[price, size]` string pairs plus `u`/`seq`. This is a **one-shot** snapshot — since there is no WebSocket, re-poll it when you need a fresh book; do not try to maintain a delta-applied local book.
 
 ## Implementation checklist
-- [ ] Pick interval and category; confirm the symbol exists via `instruments-info`.
-- [ ] Fetch in ≤1000-row pages; page backward with `end = oldestStart - 1`.
-- [ ] Reverse each raw kline batch to ascending time before storing.
-- [ ] Cast OHLCV strings to `Decimal`/float; keep timestamps as int ms (or tz-aware UTC).
-- [ ] Drop or flag the newest, unclosed candle (or check `confirm` on the WS feed).
-- [ ] Deduplicate on `(symbol, interval, startTime)`; upsert idempotently.
-- [ ] Detect gaps: expected next `startTime = prev + interval_ms`; backfill any hole.
+- [ ] Pick `category` (`linear`) and interval; confirm the symbol exists via `instruments-info`.
+- [ ] Fetch klines in ≤1000-row pages; page backward with `end = oldestStart - 1`.
+- [ ] Reverse each raw batch to ascending time before storing.
+- [ ] Cast string OHLCV to numbers (or keep as strings for exact decimal columns); keep timestamps as int ms (UTC).
+- [ ] Drop or flag the newest, unclosed candle for indicator inputs.
+- [ ] Upsert on `(symbol, interval, startTime)` via Drizzle `onDuplicateKeyUpdate` so re-runs are idempotent.
+- [ ] Detect gaps: expected next `startTime = prev + intervalMs`; backfill any hole.
 - [ ] Store funding with its per-symbol interval; store OI with its `intervalTime`.
-- [ ] Stitch REST backfill to the live WS tail with overlap, then dedupe.
+- [ ] Throttle backfill loops (timeout + rate-limit budget) to avoid a 403 IP ban.
 
 ## Do / Don't
 **Do**
 - Treat all timestamps as **milliseconds, UTC**.
-- Cast string numerics explicitly; store canonical types.
-- Upsert on `(symbol, interval, open_time)` so re-runs are idempotent.
+- Cast string numerics explicitly; pick a stable stored type.
+- Upsert on `(symbol, interval, startTime)` so backfills are idempotent.
 - Verify candle continuity and backfill gaps before computing indicators.
+- Use `/v5/market/tickers` to snapshot many symbols in one poll.
+
 **Don't**
 - Don't assume ascending order — raw kline is newest-first.
 - Don't include the forming candle in indicator/backtest inputs.
 - Don't assume an 8h funding interval — read the symbol's actual cadence.
 - Don't paginate by blindly incrementing time; page off the returned edge timestamp.
-- Don't double-count the REST/WS overlap when stitching live to history.
+- Don't try to maintain a live delta orderbook — there is no WebSocket; re-poll snapshots.
+- Don't do string math on prices/volumes (`"0.1" + "0.2"` concatenates).
 
 ## Common pitfalls
-- **Off-by-one on candle time**: `startTime` is the open, not the close. A "1m" candle at `startTime=T` covers `[T, T+60000)`.
-- **Silent gaps**: exchanges can skip a candle when there are zero trades in illiquid symbols; a naive `prev+interval` walk will then misalign. Detect and either backfill or forward-fill explicitly.
-- **String math**: `"0.1" + "0.2"` concatenates; forgetting to cast corrupts volumes/prices.
-- **Reverse-sort forgotten**: appending raw batches yields non-monotonic time and breaks TA libraries.
+- **Off-by-one on candle time:** `startTime` is the open, not the close.
+- **Silent gaps:** illiquid symbols can skip a candle with zero trades; a naive `prev + interval` walk misaligns. Detect and backfill/forward-fill explicitly.
+- **String math:** forgetting to cast corrupts volumes/prices.
+- **Reverse-sort forgotten:** appending raw batches yields non-monotonic time and breaks TA.
 - **Partial last candle** leaks look-ahead-like noise into signals.
-- **Timezone drift**: mixing local time with exchange UTC ms shifts every candle.
+- **Timezone drift:** mixing local time with exchange UTC ms shifts every candle.
+- **Missing unique index:** without a unique `(symbol, interval, startTime)`, `onDuplicateKeyUpdate` can't dedup.
 
 ## Code patterns
-Backfill a full range, ascending & deduped:
-```python
-def backfill_kline(session, category, symbol, interval, start_ms, end_ms):
-    interval_ms = {"1":60_000, "3":180_000, "5":300_000, "15":900_000,
-                   "60":3_600_000, "240":14_400_000, "D":86_400_000}[interval]
-    out, cursor_end = {}, end_ms
-    while cursor_end > start_ms:
-        r = session.get_kline(category=category, symbol=symbol,
-                              interval=interval, end=cursor_end, limit=1000)
-        rows = r["result"]["list"]           # newest-first arrays of strings
-        if not rows:
-            break
-        for k in rows:
-            t = int(k[0])
-            out[t] = (t, float(k[1]), float(k[2]), float(k[3]),
-                      float(k[4]), float(k[5]), float(k[6]))
-        cursor_end = int(rows[-1][0]) - 1     # page backward off oldest
-    return [out[t] for t in sorted(out)]      # ascending, deduped
+Fetch one kline page (public, timed-out):
+```ts
+type Kline = [string, string, string, string, string, string, string];
 
-def find_gaps(candles, interval_ms):
-    return [(candles[i-1][0], candles[i][0])
-            for i in range(1, len(candles))
-            if candles[i][0] - candles[i-1][0] != interval_ms]
+async function fetchKline(
+  base: string, symbol: string, interval: string, end: number, limit = 1000,
+): Promise<Kline[]> {
+  const qs = new URLSearchParams({
+    category: "linear", symbol, interval, end: String(end), limit: String(limit),
+  });
+  const res = await fetch(`${base}/v5/market/kline?${qs}`, { signal: AbortSignal.timeout(10_000) });
+  const data = (await res.json()) as { retCode: number; retMsg: string; result: { list: Kline[] } };
+  if (data.retCode !== 0) throw new Error(`Bybit ${data.retCode}: ${data.retMsg}`);
+  return data.result.list; // newest-first
+}
+```
+
+Backfill a range ascending + deduped, then find gaps:
+```ts
+const INTERVAL_MS: Record<string, number> = {
+  "1": 60_000, "3": 180_000, "5": 300_000, "15": 900_000,
+  "60": 3_600_000, "240": 14_400_000, D: 86_400_000,
+};
+
+async function backfill(base: string, symbol: string, interval: string, startMs: number, endMs: number) {
+  const out = new Map<number, { t: number; o: number; h: number; l: number; c: number; v: number }>();
+  let cursorEnd = endMs;
+  while (cursorEnd > startMs) {
+    const rows = await fetchKline(base, symbol, interval, cursorEnd);
+    if (rows.length === 0) break;
+    for (const k of rows) {
+      const t = Number(k[0]);
+      out.set(t, { t, o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5] });
+    }
+    cursorEnd = Number(rows[rows.length - 1][0]) - 1; // page backward off the oldest
+  }
+  return [...out.values()].sort((a, b) => a.t - b.t); // ascending, deduped
+}
+
+function findGaps(candles: { t: number }[], intervalMs: number) {
+  const gaps: [number, number][] = [];
+  for (let i = 1; i < candles.length; i++) {
+    if (candles[i].t - candles[i - 1].t !== intervalMs) gaps.push([candles[i - 1].t, candles[i].t]);
+  }
+  return gaps;
+}
+```
+
+Idempotent upsert with Drizzle (MySQL):
+```ts
+import { sql } from "drizzle-orm";
+// klines has a UNIQUE index on (symbol, interval, startTime)
+await db.insert(klines).values(
+  candles.map((c) => ({ symbol, interval, startTime: c.t, open: c.o, high: c.h, low: c.l, close: c.c, volume: c.v })),
+).onDuplicateKeyUpdate({
+  set: { high: sql`values(${klines.high})`, low: sql`values(${klines.low})`, close: sql`values(${klines.close})`, volume: sql`values(${klines.volume})` },
+});
 ```
 
 ## References
-- [Bybit V5 Get Kline](https://bybit-exchange.github.io/docs/v5/market/kline) — endpoint, interval values, array field order, 1000 limit, ms timestamps.
-- [Bybit V5 Get Recent Public Trades](https://bybit-exchange.github.io/docs/v5/market/recent-trade) — recent prints, per-category limits.
+- [Bybit V5 Get Kline](https://bybit-exchange.github.io/docs/v5/market/kline) — interval values, array field order, 1000 limit, ms timestamps.
+- [Bybit V5 Get Tickers](https://bybit-exchange.github.io/docs/v5/market/tickers) — snapshot with lastPrice, fundingRate, openInterest, markPrice (collector).
 - [Bybit V5 Get Funding Rate History](https://bybit-exchange.github.io/docs/v5/market/history-fund-rate) — fundingRate/timestamp, per-symbol interval note.
 - [Bybit V5 Get Open Interest](https://bybit-exchange.github.io/docs/v5/market/open-interest) — intervalTime options, cursor pagination.
-- [Bybit V5 Get Tickers](https://bybit-exchange.github.io/docs/v5/market/tickers) — snapshot with fundingRate, openInterest, markPrice.
 - [Bybit V5 Get Orderbook](https://bybit-exchange.github.io/docs/v5/market/orderbook) — REST snapshot, b/a pairs, u/seq fields.
 - [Bybit V5 Get Instruments Info](https://bybit-exchange.github.io/docs/v5/market/instrument) — validate symbols, tick/lot filters.
-- [Bybit V5 Rate Limit Rules](https://bybit-exchange.github.io/docs/v5/rate-limit) — throttle backfill loops to avoid IP bans.
-- [pybit (official Python SDK)](https://github.com/bybit-exchange/pybit) — get_kline, get_funding_rate_history, get_open_interest.
-- [CCXT documentation](https://docs.ccxt.com/) — fetch_ohlcv normalization (ascending, ms, numeric) and `since` pagination.
+- [Bybit V5 Rate Limit Rules](https://bybit-exchange.github.io/docs/v5/rate-limit) — throttle backfill polls to avoid IP bans.
+- [Drizzle ORM — Insert & Upsert](https://orm.drizzle.team/docs/insert) — `.onDuplicateKeyUpdate({ set })` for idempotent MySQL upserts.
+- [Drizzle ORM — Upsert guide](https://orm.drizzle.team/docs/guides/upsert) — multi-row upsert with `sql\`values(...)\``.
+- [Bun fetch / Web APIs](https://bun.com/docs/runtime/web-apis) — global `fetch` and Web Standard APIs on Bun.
+- [MDN AbortSignal.timeout()](https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/timeout_static) — per-poll fetch timeouts.

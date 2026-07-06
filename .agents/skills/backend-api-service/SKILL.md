@@ -1,138 +1,172 @@
 ---
 name: backend-api-service
-description: Building the Python FastAPI backend for a multi-bot crypto trading platform — async REST endpoints, pydantic v2 request/response models, dependency injection (Depends/Security), WebSocket streaming to the frontend, JWT/session auth, OAuth2 scopes + RBAC for multi-user, request validation, rate limiting (slowapi), background tasks vs a separate worker (Celery/ARQ), OpenAPI docs, and structured logging (structlog). Invoke when the task mentions FastAPI, uvicorn/gunicorn, "backend API", "async endpoint", "websocket endpoint", pydantic model, Depends, JWT login, RBAC/roles/scopes, rate limit, background task, worker, "OpenAPI docs", CORS, or serving live PnL/positions/orders to a dashboard.
+description: Building the TypeScript backend for a multi-bot Bybit crypto trading platform on Bun — a Hono HTTP server exposing an end-to-end typed tRPC v11 API (Zod inputs), Better-Auth (Google + email) sessions in the tRPC context, protected/RBAC procedures, TRPCError handling + errorFormatter, serving the React panel, and reading/writing the same Drizzle/MySQL tables the engine uses — all inside ONE Bun process that also runs the 6 background loops (collector, v3 Bybit engine, optimizer, calendar/news scrapers). Invoke when the task mentions Hono, tRPC router/procedure, Bun server, Better-Auth, protectedProcedure, session context, Zod input, Drizzle query from the API, tRPC error handling, serving the SPA, or wiring the API to the engine's data via reconcile/decision-log tables.
 ---
 
-# Backend API Service (FastAPI)
+# Backend API Service (Bun + Hono + tRPC v11)
 
 ## When to use this skill
-- Scaffolding or extending the platform backend: routers, pydantic schemas, dependency-injected services.
-- Adding auth: JWT login, session cookies, OAuth2 password flow, refresh tokens, RBAC/scopes per user.
-- Exposing a WebSocket endpoint that fans out live bot state (PnL, positions, orders, fills) to the UI.
-- Deciding between `BackgroundTasks` (in-process) and a separate worker (Celery/ARQ) for bot execution or heavy jobs.
-- Adding rate limiting, request validation, CORS, structured JSON logging, or OpenAPI/Swagger docs.
-- Configuring uvicorn/gunicorn for production (workers, reload, proxy headers).
+- Scaffolding or extending the control-plane API: new tRPC routers, procedures, Zod input schemas.
+- Adding auth: Better-Auth (Google OAuth + email/password) sessions, putting the user in tRPC context, `protectedProcedure` and role checks (RBAC).
+- Exposing bot state (live PnL, positions, orders, `v3_decision_log`, `v3_position_event`) to the dashboard as typed tRPC queries the UI polls.
+- Mounting the Hono server on Bun so it serves the built React SPA AND the tRPC API from a single process/container.
+- Deciding how the API shares Drizzle/MySQL data with the 6 background loops without stepping on the engine's writes.
+- Consistent error handling: `TRPCError` codes, `errorFormatter`, `onError` logging (no secrets).
 
 ## Core concepts
-- **ASGI**: FastAPI is an ASGI app served by uvicorn (dev/single-loop) or gunicorn with `uvicorn.workers.UvicornWorker` (multi-process). Each worker is one process with its own event loop and memory — in-memory WebSocket connection registries are **per-worker**, so cross-worker broadcast needs Redis pub/sub.
-- **async vs sync path operations**: `async def` runs on the event loop; `def` is offloaded to a threadpool. **Never** call blocking I/O (requests, time.sleep, sync DB drivers, pybit sync calls) inside `async def` — it stalls the whole worker. Either use async libs (httpx, asyncpg, ccxt.pro) or make the handler `def`.
-- **Dependency Injection**: `Depends(...)` resolves and caches values per-request (DB sessions, current user, exchange clients). `Security(dep, scopes=[...])` is `Depends` plus OAuth2 scope enforcement.
-- **pydantic v2**: request/response validation & serialization. Use `model_config = ConfigDict(from_attributes=True)` (replaces v1 `orm_mode`) to return ORM objects. Separate `*Create` / `*Read` / `*Update` schemas; never expose secrets in a Read model.
-- **Auth model**: authentication (who are you — JWT/session) vs authorization (what may you do — RBAC roles / OAuth2 scopes). For a trading platform, scope trade actions (`bots:write`, `orders:cancel`) separately from read (`positions:read`).
-- **Background work**: `BackgroundTasks` runs after the response *in the same process* — fine for fire-and-forget (send email, write audit row), fatal for long/CPU-bound work (it blocks the worker and dies on restart). Long-running bot loops and backtests belong in a **separate worker** (Celery/ARQ + Redis broker) so they survive API restarts and scale independently.
+- **One process, many responsibilities.** On boot the Bun entrypoint runs `ensureSchema()` (idempotent `ALTER TABLE`, no migration files), then starts the 6 loops (collector, v3 Bybit engine @10s, optimizer @2h, calendar scraper @15m, news scraper @3m) **and** starts the Hono server. The API and the engine live in the same process and share the same Drizzle connection pool and MySQL tables — the API is a *reader/reconciler* of engine state, not a second writer of positions.
+- **Hono is the HTTP shell.** Hono is a tiny, runtime-agnostic web framework (`new Hono()`, `app.get/post`, `c.req`, `c.json`) that runs natively on Bun via `Bun.serve` / `export default app`. It handles routing, middleware, CORS, static-file serving, and mounts the Better-Auth handler and the tRPC adapter.
+- **tRPC v11 is the API layer.** Procedures are functions; the client imports only the `AppRouter` *type*, so calls are end-to-end typed with zero codegen. `t.procedure.input(zodSchema).query(...)` / `.mutation(...)`. Inputs are validated by Zod at the boundary — invalid input becomes a `BAD_REQUEST` before your resolver runs.
+- **Context = per-request state.** `createContext({ req })` runs once per request (shared across a batched call) and returns `{ db, session, user }`. Better-Auth resolves the session from the request cookie/headers; the context carries it into every procedure and middleware.
+- **Protected procedures = auth middleware.** A `protectedProcedure` is `publicProcedure.use(mw)` where the middleware throws `TRPCError({ code: 'UNAUTHORIZED' })` if `ctx.session` is null, and otherwise calls `next({ ctx: { user: ctx.user } })` so downstream resolvers get a **non-null** user type. Layer a second middleware for RBAC (role/ownership) → `FORBIDDEN`.
+- **Errors are typed and shaped.** Throw `TRPCError` with a standard code (`UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `BAD_REQUEST`, `TOO_MANY_REQUESTS`, `INTERNAL_SERVER_ERROR`). Use `errorFormatter` to add fields (e.g. flatten Zod issues) to the client-visible shape; use `onError` only for logging/side-effects — and scrub secrets there.
 
-## Python & stack specifics
-- Stack: `fastapi`, `uvicorn[standard]`, `pydantic` v2, `pydantic-settings` (config from env), `python-jose[cryptography]` or `pyjwt` for JWT, `passlib[bcrypt]` for password hashing, `slowapi` for rate limiting, `structlog` for logging, `httpx`/`asyncpg`/SQLAlchemy 2.0 async for I/O.
-- **OpenAPI**: auto-generated at `/openapi.json`, Swagger UI at `/docs`, ReDoc at `/redoc`. Add `summary`, `description`, `response_model`, and `tags` to routes so the generated spec is usable by the frontend codegen. Note: WebSocket routes are **not** described in OpenAPI — document their message contract manually.
-- **CORS**: add `CORSMiddleware` with an explicit `allow_origins` list (the dashboard origin) — never `["*"]` together with `allow_credentials=True`.
-- **Rate limiting**: `slowapi` (`Limiter(key_func=get_remote_address)`), decorate routes with `@limiter.limit("100/minute")`; back it with Redis for multi-worker correctness. Protect `/auth/login` tightly (e.g. `5/minute`) to blunt credential stuffing.
-- **Config**: load all secrets (JWT signing key, DB URL, Redis URL) via `pydantic-settings` `BaseSettings` from env — never hardcode. See the `api-key-secrets-security` skill for exchange keys.
-- **Production run**: `gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w <2*cores+1> --bind 0.0.0.0:8000`. Behind a reverse proxy set `--proxy-headers` / `forwarded-allow-ips`. Use `--reload` only in dev.
+## Codebase specifics (Bun / Hono / tRPC / Drizzle / Better-Auth)
+- **Runtime & deploy:** Bun (not Node). Turborepo monorepo: the server app lives in `apps/`, shared pure logic and types in `packages/`. Push to `main` → Dokploy builds one Docker image and deploys one container. No migration files; schema is guaranteed by `ensure-schema.ts`.
+- **Mounting order in Hono:** (1) CORS for the panel origin (credentials on, explicit origin — never `*` with credentials); (2) Better-Auth handler at `app.on(['GET','POST'], '/api/auth/*', c => auth.handler(c.req.raw))`; (3) tRPC at `/trpc/*` via the `@hono/trpc-server` middleware, passing `createContext`; (4) static serving of the built Vite SPA (`serveStatic`) with an SPA fallback to `index.html` last.
+- **Data access:** all DB access goes through Drizzle (`drizzle-orm/mysql2` or Bun's driver). The API reads engine-owned tables (positions view, `v3_decision_log`, `v3_position_event`, user configs) and writes only *its own* domain (user config edits, enabling/disabling a bot slot, saving encrypted API keys). It must **not** place exchange orders directly — that is the engine's job; the API flips config/flags the engine reads on its next 10s turn.
+- **Reconcile boundary:** the exchange is the source of truth; the DB is the ledger. When the panel shows "positions", prefer the reconciled DB rows the engine maintains rather than issuing your own signed Bybit call per page-load (rate-limit budget is shared). If you must hit Bybit live, see `exchange-integration-bybit` and reuse the signed-fetch helper.
+- **Auth providers:** Better-Auth configured with the Google social provider and email/password; sessions via signed cookies (optionally cookie-cache to avoid a DB hit per request). Roles/ownership live on the user/config rows; enforce per-user isolation so user A can never read user B's configs, keys, or PnL.
+- **Zod everywhere:** every mutation input (config edits, key upload, slot toggles) has a Zod schema; reuse those schemas in `packages/` so the UI and server validate identically.
 
 ## Implementation checklist
-- [ ] App factory in `app/main.py`; mount routers with `APIRouter(prefix=..., tags=...)`.
-- [ ] `pydantic-settings` `Settings` for env config; inject via `Depends(get_settings)` with `@lru_cache`.
-- [ ] Define `*Create`/`*Read` schemas; set `response_model=` on every route; never return raw secrets.
-- [ ] Auth: `OAuth2PasswordBearer` token URL, `/auth/login` issuing a short-lived access JWT (+ refresh), bcrypt-hashed passwords, `get_current_user` dependency validating the token and loading the user.
-- [ ] RBAC: put roles/scopes in the JWT; enforce with `Security(get_current_user, scopes=["orders:cancel"])`; return 403 on missing scope, 401 on bad/expired token.
-- [ ] WebSocket endpoint: authenticate on connect (token via query param or first message), register the socket in a `ConnectionManager`, push updates, handle `WebSocketDisconnect`.
-- [ ] For cross-worker fan-out, publish bot events to Redis pub/sub and have each worker relay to its local sockets.
-- [ ] Rate-limit auth + write endpoints; add CORS with explicit origins.
-- [ ] Structured logging: JSON logs with a per-request correlation/request id via middleware; scrub secrets.
-- [ ] Long-running / CPU-bound work → Celery or ARQ worker, not `BackgroundTasks`.
-- [ ] Global exception handlers returning consistent error envelopes; `/health` and `/ready` probes.
+- [ ] Bun entrypoint: `ensureSchema()` → start 6 loops → `export default { fetch: app.fetch }` (or `Bun.serve`). Loops started with `void startLoop()`; never block the server boot.
+- [ ] `initTRPC.context<Context>().create({ errorFormatter })`; export `router`, `publicProcedure`, `protectedProcedure`.
+- [ ] `createContext`: read Better-Auth session from `req.headers`, attach `{ db, session, user }`.
+- [ ] `protectedProcedure` middleware → `UNAUTHORIZED` when no session; RBAC/ownership middleware → `FORBIDDEN`.
+- [ ] Feature routers (`bots`, `positions`, `orders`, `configs`, `keys`, `logs`) merged into one `appRouter`; `export type AppRouter = typeof appRouter`.
+- [ ] Mount Better-Auth handler + `@hono/trpc-server` on Hono; add CORS with explicit panel origin + credentials.
+- [ ] Serve the built SPA via `serveStatic` with `index.html` fallback for client routes.
+- [ ] Zod input schema on every mutation; share schemas from `packages/`.
+- [ ] `onError` logs `path`+`code` with a request id and **scrubbed** payload (never the API secret); map unexpected throws to `INTERNAL_SERVER_ERROR`.
+- [ ] `/health` route (plain Hono) returning loop heartbeats/last-tick timestamps for Dokploy.
+- [ ] Per-user isolation asserted in every resolver: filter by `ctx.user.id`; never trust an id from input alone.
 
 ## Do / Don't
 **Do**
-- Keep secrets and signing keys in env/secret manager; use short access-token TTLs (5–15 min) plus refresh tokens.
-- Validate every inbound payload with pydantic; reject unknown fields where it matters (`model_config extra="forbid"`).
-- Use async DB/HTTP clients in `async def`, or drop to `def` for blocking libraries.
-- Give each bot action its own scope so a read-only dashboard token cannot place or cancel orders.
-- Send heartbeats/pings on WebSockets and handle reconnect on the client.
+- Keep decision math as pure, tested functions in `packages/`; keep DB/exchange side-effects in the engine and thin resolvers.
+- Validate every input with Zod; reuse the same schema client and server.
+- Resolve the session once in `createContext` and read it from `ctx` everywhere.
+- Return purpose-built DTOs; strip secrets and internal columns before sending to the client.
+- Let the engine own order placement; the API only edits config/flags it reads next tick.
 
 **Don't**
-- Don't run blocking calls (sync pybit, `requests`, `time.sleep`, heavy pandas) inside `async def` — it freezes the worker's event loop and every connected socket.
-- Don't use `BackgroundTasks` for the live trading loop or backtests — they die with the request/worker.
-- Don't rely on in-memory state (connection lists, rate counters) across multiple gunicorn workers — use Redis.
-- Don't return ORM/user objects that include password hashes or API keys; use a dedicated Read model.
-- Don't set `allow_origins=["*"]` with credentials, or ship `--reload` / open `/docs` to the public internet unauthenticated.
+- Don't block the event loop with long/sync work in a resolver — Bun is single-process here; a stalled handler stalls the loops too. Offload to the periodic loops, not to the request.
+- Don't place Bybit orders or run heavy scans inside a tRPC request; that's the engine's job and burns the shared rate-limit budget.
+- Don't return raw user/config rows containing encrypted key material or another user's data.
+- Don't use `onError` to reshape client errors (use `errorFormatter`); don't log secrets in either.
+- Don't set CORS `allow_origins:'*'` together with credentials.
 
 ## Common pitfalls
-- **Event-loop stalls**: one blocking call in an async route degrades latency for all clients on that worker — the #1 FastAPI perf killer.
-- **Per-worker WebSocket registries**: broadcasts only reach clients on the same worker; users randomly "miss" updates until you add Redis pub/sub.
-- **JWT `exp`/clock**: expired-token 401s and skewed server clocks; verify `exp`/`nbf` and keep servers NTP-synced.
-- **Refresh-token rotation**: without rotation + revocation list, a leaked refresh token is a permanent session.
-- **Rate limiter without shared store**: per-worker counters let real limits be N× higher than intended.
-- **N+1 / sync DB in async**: SQLAlchemy sync sessions in async routes silently block; use the async engine.
+- **Session not in context:** forgetting to pass `req` (headers) into Better-Auth's `getSession` → every `protectedProcedure` 401s. Resolve it in `createContext`, not per-procedure.
+- **Batching + context:** `createContext` runs once per HTTP request even when tRPC batches many calls — don't assume one context per procedure.
+- **Zod flat errors lost:** without an `errorFormatter` that flattens `error.cause` (ZodError), the client sees a generic message instead of field errors.
+- **Double source of truth:** the API issuing its own Bybit position reads that disagree with the engine's reconciled rows — pick the ledger for display, reconcile in the engine.
+- **Leaking cross-tenant data:** trusting a `userId`/`configId` from procedure input instead of `ctx.user.id` — always scope queries to the session user.
+- **Static fallback shadowing the API:** registering the SPA catch-all before `/trpc` or `/api/auth` so API routes 404 into `index.html` — mount static last.
 
 ## Code patterns
-```python
-# app/deps.py — auth + RBAC via OAuth2 scopes
-from fastapi import Depends, HTTPException, Security, status
-from fastapi.security import OAuth2PasswordBearer, SecurityScopes
-from jose import JWTError, jwt
+```ts
+// trpc.ts — init, context, protected procedure (tRPC v11)
+import { initTRPC, TRPCError } from '@trpc/server';
+import { ZodError } from 'zod';
+import { auth } from './auth';          // Better-Auth instance
+import { db } from './db';              // Drizzle client
 
-oauth2_scheme = OAuth2PasswordBearer(
-    tokenUrl="auth/login",
-    scopes={"positions:read": "Read positions/PnL", "orders:cancel": "Cancel orders"},
-)
+export async function createContext({ req }: { req: Request }) {
+  const session = await auth.api.getSession({ headers: req.headers });
+  return { db, session, user: session?.user ?? null };
+}
+type Context = Awaited<ReturnType<typeof createContext>>;
 
-async def get_current_user(security_scopes: SecurityScopes, token: str = Depends(oauth2_scheme)):
-    authenticate = f'Bearer scope="{security_scopes.scope_str}"'
-    cred_exc = HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid token",
-                             headers={"WWW-Authenticate": authenticate})
-    try:
-        payload = jwt.decode(token, SETTINGS.jwt_key, algorithms=["HS256"])
-    except JWTError:
-        raise cred_exc
-    token_scopes = set(payload.get("scopes", []))
-    for scope in security_scopes.scopes:          # enforce RBAC
-        if scope not in token_scopes:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Not enough permissions",
-                                headers={"WWW-Authenticate": authenticate})
-    return await load_user(payload["sub"])
+const t = initTRPC.context<Context>().create({
+  errorFormatter({ shape, error }) {
+    return {
+      ...shape,
+      data: {
+        ...shape.data,
+        zod: error.cause instanceof ZodError ? error.cause.flatten() : null,
+      },
+    };
+  },
+});
 
-@app.post("/orders/{order_id}/cancel")
-async def cancel_order(order_id: str,
-                       user=Security(get_current_user, scopes=["orders:cancel"])):
-    ...
+export const router = t.router;
+export const publicProcedure = t.procedure;
+
+export const protectedProcedure = t.procedure.use(({ ctx, next }) => {
+  if (!ctx.session || !ctx.user) throw new TRPCError({ code: 'UNAUTHORIZED' });
+  return next({ ctx: { ...ctx, user: ctx.user } }); // user is now non-null downstream
+});
 ```
 
-```python
-# WebSocket fan-out with auth + disconnect handling
-from fastapi import WebSocket, WebSocketDisconnect
+```ts
+// routers/positions.ts — typed, per-user, reads the engine's ledger
+import { z } from 'zod';
+import { and, desc, eq } from 'drizzle-orm';
+import { router, protectedProcedure } from '../trpc';
+import { v3Positions, v3DecisionLog } from '../schema';
 
-class ConnectionManager:
-    def __init__(self): self.active: set[WebSocket] = set()
-    async def connect(self, ws): await ws.accept(); self.active.add(ws)
-    def disconnect(self, ws): self.active.discard(ws)
-    async def broadcast(self, msg: dict):
-        for ws in list(self.active):
-            try: await ws.send_json(msg)
-            except Exception: self.disconnect(ws)
+export const positionsRouter = router({
+  list: protectedProcedure.query(({ ctx }) =>
+    ctx.db.select().from(v3Positions).where(eq(v3Positions.userId, ctx.user.id)),
+  ),
+  decisions: protectedProcedure
+    .input(z.object({ symbol: z.string().optional(), limit: z.number().max(200).default(50) }))
+    .query(({ ctx, input }) =>
+      ctx.db.select().from(v3DecisionLog)
+        .where(and(
+          eq(v3DecisionLog.userId, ctx.user.id),
+          input.symbol ? eq(v3DecisionLog.symbol, input.symbol) : undefined,
+        ))
+        .orderBy(desc(v3DecisionLog.createdAt))
+        .limit(input.limit),
+    ),
+});
+```
 
-manager = ConnectionManager()
+```ts
+// server.ts — Hono on Bun: auth + tRPC + SPA in one process
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+import { serveStatic } from 'hono/bun';
+import { trpcServer } from '@hono/trpc-server';
+import { auth } from './auth';
+import { appRouter } from './routers';
+import { createContext } from './trpc';
+import { ensureSchema } from './ensure-schema';
+import { startLoops } from './loops';
 
-@app.websocket("/ws/live")
-async def live(ws: WebSocket, token: str):
-    user = await authenticate_ws(token)      # reject before accept if invalid
-    if not user: return await ws.close(code=1008)
-    await manager.connect(ws)
-    try:
-        while True:
-            await ws.receive_text()          # keepalive / client pings
-    except WebSocketDisconnect:
-        manager.disconnect(ws)
+await ensureSchema();      // idempotent ALTER TABLE, no migration files
+startLoops();              // collector, v3 Bybit engine, optimizer, scrapers
+
+const app = new Hono();
+app.use('/trpc/*', cors({ origin: process.env.PANEL_ORIGIN!, credentials: true }));
+app.on(['GET', 'POST'], '/api/auth/*', (c) => auth.handler(c.req.raw));
+app.use('/trpc/*', trpcServer({
+  router: appRouter,
+  createContext: (_opts, c) => createContext({ req: c.req.raw }),
+}));
+app.get('/health', (c) => c.json({ ok: true }));
+app.use('*', serveStatic({ root: './web/dist' }));           // built React SPA
+app.get('*', serveStatic({ path: './web/dist/index.html' })); // SPA fallback (last)
+
+export default app; // Bun serves app.fetch
 ```
 
 ## References
-- [FastAPI documentation](https://fastapi.tiangolo.com/) — official framework docs: routing, DI, validation.
-- [FastAPI — OAuth2 scopes](https://fastapi.tiangolo.com/advanced/security/oauth2-scopes/) — scope-based RBAC with `Security`/`SecurityScopes`.
-- [FastAPI — WebSockets](https://fastapi.tiangolo.com/advanced/websockets/) — WebSocket endpoints, connection management, broadcasting.
-- [FastAPI — Background Tasks](https://fastapi.tiangolo.com/tutorial/background-tasks/) — in-process background work and its limits.
-- [Uvicorn](https://www.uvicorn.org/) — ASGI server, workers, gunicorn integration, proxy headers.
-- [Pydantic documentation](https://docs.pydantic.dev/latest/) — v2 models, `ConfigDict`, validation, settings.
-- [slowapi](https://github.com/laurentS/slowapi) — FastAPI/Starlette rate limiting (Redis-backed).
-- [structlog](https://www.structlog.org/en/stable/) — structured/JSON logging with bound context.
-- [Securing FastAPI with JWT (TestDriven.io)](https://testdriven.io/blog/fastapi-jwt-auth/) — practical JWT login/refresh walkthrough.
-- [Authentication & Authorization with FastAPI (Better Stack)](https://betterstack.com/community/guides/scaling-python/authentication-fastapi/) — end-to-end auth patterns.
+- [Hono documentation](https://hono.dev/docs/) — runtime-agnostic web framework; routing, middleware, Bun adapter.
+- [Hono — RPC / tRPC & third-party middleware](https://hono.dev/docs/guides/rpc) — mounting APIs and the `@hono/trpc-server` adapter on Hono.
+- [Hono — Better Auth integration](https://hono.dev/examples/better-auth) — mounting `auth.handler` and session middleware on Hono.
+- [tRPC — Define procedures](https://trpc.io/docs/server/procedures) — queries/mutations, `publicProcedure`, composition.
+- [tRPC — Context](https://trpc.io/docs/server/context) — per-request context, `createContext`, batching behavior.
+- [tRPC — Middlewares](https://trpc.io/docs/server/middlewares) — `protectedProcedure` / auth middleware pattern with `next()`.
+- [tRPC — Input & output validators](https://trpc.io/docs/server/validators) — Zod input validation on procedures.
+- [tRPC — Error handling](https://trpc.io/docs/server/error-handling) — `TRPCError`, error codes, `onError`.
+- [tRPC — Error formatting](https://trpc.io/docs/server/error-formatting) — `errorFormatter`, flattening Zod errors into the client shape.
+- [Better Auth — Hono integration](https://better-auth.com/docs/integrations/hono) — mounting the handler, session in context.
+- [Better Auth — Session management](https://better-auth.com/docs/concepts/session-management) — `auth.api.getSession`, cookie caching.
+- [Drizzle ORM — MySQL](https://orm.drizzle.team/docs/get-started/mysql-new) — connection, `mysqlTable`, typed queries.
+- [Drizzle ORM — Schema declaration](https://orm.drizzle.team/docs/sql-schema-declaration) — defining tables/columns used by API and engine.
+- [Bun — HTTP server](https://bun.com/docs/api/http) — `Bun.serve` / `export default { fetch }` used to serve Hono.
+- [Better-T-Stack (reference monorepo)](https://github.com/AmanVarshney01/Better-T-Stack) — Hono + tRPC + Better-Auth + Drizzle + TanStack on Bun, same stack.

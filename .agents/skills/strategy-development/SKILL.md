@@ -1,130 +1,193 @@
 ---
 name: strategy-development
-description: Building crypto trading strategy logic for Bybit bots in Python — signal generation, technical indicators (pandas-ta, TA-Lib, ta), entry/exit rules, multi-timeframe design, indicator warmup/startup periods, avoiding repainting and look-ahead, separating strategy from execution, and parameterizing for optimization. Invoke when the user mentions "trading strategy", "signal", "indicator", "RSI/MACD/EMA/Bollinger", "entry/exit rules", "timeframe", "warmup/startup candles", "repainting", "pandas-ta", "TA-Lib", "populate_indicators", "strategy parameters", or asks how a bot should decide to buy/sell on Bybit.
+description: Building crypto trading decision logic for the Bybit v3 engine in TypeScript (Bun) as PURE, deterministic, unit-tested functions that live in a shared package (pure core) and are kept out of the engine's exchange/DB side effects (dirty shell). Covers signal generation and hand-rolled indicators in TS (EMA/RSI/ATR/ADX — no pandas, no pandas-ta), entry/exit rules, layering (katman) add thresholds, the coin-selector, and the guards (news / calendar / BTC-shock / cooldown) that gate entries, plus avoiding look-ahead on polled klines. Invoke when the user mentions "strategy", "signal", "indicator", "EMA/RSI/ATR", "entry/exit rule", "layering", "katman", "coin selector", "guard", "news/calendar/BTC-shock/cooldown gate", "pure core", "decision log", "deterministic", "look-ahead", "bun:test", or asks how the bot should decide to long/short a Bybit perp.
 ---
 
 # Strategy Development
 
 ## When to use this skill
-- Designing signal logic: "when should the bot go long/short on BTCUSDT?"
-- Adding or choosing technical indicators (RSI, MACD, EMA/SMA, Bollinger, ATR, ADX, SuperTrend).
-- Structuring entry/exit rules and translating them into a dataframe of signals.
-- Choosing timeframes and setting the correct indicator warmup / startup candle count.
-- Diagnosing repainting or look-ahead ("my backtest is amazing but live loses money").
-- Parameterizing a strategy so it can be optimized/hyperopted without touching execution code.
+- Designing entry/exit logic: "when should the v3 engine open a long on a Bybit perp?"
+- Adding or choosing indicators computed in TypeScript (EMA, RSI, ATR, ADX, SMA) with no Python/pandas.
+- Writing the layering (katman) add rules and per-coin candidate scoring in the coin-selector.
+- Implementing or tuning the guards (news / calendar / BTC-shock / cooldown) that veto an entry.
+- Moving decision math out of the inlined Bybit engine into a pure, `bun:test`-covered package.
+- Diagnosing "backtest looks great, live loses money" — usually look-ahead on the still-forming candle.
 
 ## Core concepts
-- **Signal generation**: a strategy converts OHLCV candles into discrete intent — enter_long, enter_short, exit — usually as boolean columns on a pandas DataFrame indexed by candle close time.
-- **Indicator warmup / startup period**: rolling indicators (EMA200, ATR14) emit NaN or wrong values until enough candles exist. You must skip the unstable prefix. In Freqtrade this is `startup_candle_count`; set it to the largest lookback any indicator uses (e.g. an EMA200 + a 14-period ATR ⇒ ≥ 200).
-- **Repainting**: a signal that changes value on an already-closed candle after the fact. Caused by using indicators that reference future candles, by acting on the *current, still-forming* candle, or by centered/recalculated indicators. A repainting strategy backtests beautifully and fails live.
-- **Look-ahead bias**: using information not yet available at decision time (e.g. today's close to decide today's open trade, or `.shift(-1)`, `max()` over the whole series, resampling that leaks future bars).
-- **Timeframe**: the candle interval that drives signals (Bybit `interval`: 1,3,5,15,30,60,120,240,360,720,D,W,M). Higher timeframes = fewer, more robust signals; lower = more noise and fees. Multi-timeframe strategies compute a trend filter on a higher TF and time entries on a lower TF.
-- **Separation of concerns**: the strategy is a *pure function* of market data → signals + desired risk (stop, target, size hint). It must NOT call the exchange. A separate execution/OMS layer turns signals into Bybit orders. This makes the same code testable in backtest and live.
+- **Pure core / dirty shell.** A strategy is a *pure function*: `(candles, config, guardState) -> Decision`. It performs no `fetch`, no DB read/write, no `Date.now()`, no randomness. All effects (Bybit REST, Drizzle writes) live in the engine (the shell). This is what makes the same code runnable in the live loop AND the backtester, and unit-testable with `bun:test`.
+- **Determinism.** Given identical inputs the function must return an identical `Decision` and identical `reason` string. Inject the clock and any thresholds via `config`; never read wall-clock time or env inside the core.
+- **Signal generation.** Convert OHLCV klines into a discrete intent — `enterLong` / `enterShort` / `hold` / `close` / `addLayer` — plus risk hints (stop distance, size weight) consumed by the OMS, never acted on inside the core.
+- **Indicators in TypeScript.** No pandas-ta / TA-Lib. Hand-roll EMA/RSI/ATR/ADX or use a small TS lib. Rolling indicators (EMA200, ATR14, Wilder RSI) are undefined until enough candles exist — track a `warmup = max lookback` and refuse to emit signals before it.
+- **Look-ahead / repainting.** The engine polls REST every ~10s, so the *latest* kline is usually still forming. Decide only on **confirmed/closed** candles; drop the last in-progress bar. Never reference a future bar, whole-array `Math.max`, or an indicator that recomputes past values.
+- **Guards gate entries.** An otherwise-valid signal is vetoed by: **news** (Gemini sentiment score too negative for the coin), **calendar** (high-impact event window near now), **BTC-shock** (BTC moved > X% in the lookback → risk-off), and **cooldown** (this symbol/user was stopped-out or entered too recently). Guards are pure predicates over injected state.
+- **Layering (katman).** Positions are built in layers: after the first entry, add another layer only when price has moved against the average entry by a configured threshold AND the layer budget/limit allows. This is pure arithmetic over the current position snapshot + config.
 
-## Python & stack specifics
-Indicator libraries (pick one primary, know the trade-offs):
-- **pandas-ta**: pure-Python pandas extension, 130+ indicators, no system deps. `df.ta.rsi(length=14)` or `df.ta.macd()`. Easiest to install; slower than TA-Lib on huge data.
-- **TA-Lib** (`ta-lib-python`): Cython wrapper over the C library, 2-4x faster, 150+ indicators + 60 candlestick patterns. Requires the native `ta-lib` C library installed first. Function API returns numpy arrays: `talib.RSI(close, timeperiod=14)`; Abstract API: `from talib.abstract import *`.
-- **ta** (bukosabino): pure-Python, clean class API, good for a light dependency footprint.
-
-Design a strategy as data-in / signals-out so backtester and live bot share it:
-
-```python
-import pandas as pd
-import pandas_ta as ta
-
-class Params:                      # parameterize everything tunable
-    ema_fast: int = 21
-    ema_slow: int = 55
-    rsi_len: int = 14
-    rsi_floor: float = 50.0
-    atr_len: int = 14
-    startup: int = 55              # = max lookback; drop this many leading candles
-
-def add_indicators(df: pd.DataFrame, p=Params) -> pd.DataFrame:
-    df = df.copy()
-    df["ema_fast"] = ta.ema(df["close"], length=p.ema_fast)
-    df["ema_slow"] = ta.ema(df["close"], length=p.ema_slow)
-    df["rsi"]      = ta.rsi(df["close"], length=p.rsi_len)
-    df["atr"]      = ta.atr(df["high"], df["low"], df["close"], length=p.atr_len)
-    return df
-
-def signals(df: pd.DataFrame, p=Params) -> pd.DataFrame:
-    df = add_indicators(df, p)
-    cross_up = (df["ema_fast"] > df["ema_slow"]) & \
-               (df["ema_fast"].shift(1) <= df["ema_slow"].shift(1))
-    df["enter_long"] = cross_up & (df["rsi"] > p.rsi_floor)
-    df["exit_long"]  = df["ema_fast"] < df["ema_slow"]
-    # suggested risk, consumed by the execution/OMS layer (never here):
-    df["stop_dist"]  = 2.0 * df["atr"]
-    return df.iloc[p.startup:]      # drop unstable warmup region
-```
-
-Bybit relevance: strategies run on Bybit kline data (via pybit `get_kline` / CCXT `fetch_ohlcv` with the `bybit` id). Always trade on the *closed* candle: pull the last **confirmed** kline, not the in-progress one. On the WebSocket kline stream, act only when the message's `confirm` flag is `true`.
+## Codebase specifics
+- **Where it lives.** Decision math belongs in a shared `packages/` library (the same "pure core" pattern the Binance side already uses), exported as plain functions. The **v3 Bybit engine** (a `~10s` loop in `apps/`) imports and calls them. Known deviation: the Bybit engine currently inlines some of this logic — steer new work back into the pure package so it can be tested.
+- **Runtime.** Bun + TypeScript strict. Tests are `*.test.ts` run with `bun test` (`import { test, expect, describe } from "bun:test"`). No Jest, no ts-node.
+- **Data shape.** Klines come from polled Bybit V5 REST (`/v5/market/kline`), returned newest-first as string arrays `[start, open, high, low, close, volume, turnover]`. Normalize once (reverse to oldest-first, parse to numbers, drop the unconfirmed last bar) before handing to the core.
+- **Config.** Per-user strategy config is read from MySQL via Drizzle and validated with Zod at the edge; the core receives an already-parsed, typed config object — it does not re-read the DB.
+- **Decision logging.** Every core `Decision` (including "hold, guard=news") is written by the shell to `v3_decision_log`; position changes go to `v3_position_event`. The core returns a structured, serializable `Decision`; the shell persists it. Keep the `reason` machine-readable (e.g. `guard:btc_shock`).
+- **Bybit-only.** Do not add Binance examples here. One-way position mode assumed (`positionIdx: 0`).
 
 ## Implementation checklist
-- [ ] Fix the primary timeframe and any higher-TF trend filter up front.
-- [ ] List every indicator's lookback; set `startup`/`startup_candle_count` = the max, and drop that prefix.
-- [ ] Compute indicators only from data available at or before the current closed candle.
-- [ ] Emit signals on **closed** candles only (`confirm==true` on WS; drop the last live row on REST).
-- [ ] Return signals + risk hints (stop distance, target, size weight) — no exchange calls.
-- [ ] Expose all thresholds/lengths as parameters (a dataclass or pydantic model), not magic numbers.
-- [ ] Run Freqtrade `lookahead-analysis` / `recursive-analysis` (or an equivalent shift test) before trusting results.
-- [ ] Sanity-check on out-of-sample data before wiring to execution.
+- [ ] Define `Decision` and `StrategyConfig` types; validate config with Zod at the shell boundary.
+- [ ] Normalize klines: oldest-first, numeric, **drop the unconfirmed last candle**.
+- [ ] Compute indicators purely; set `warmup = max(lookbacks)` and return `hold` until enough bars.
+- [ ] Express entry/exit as pure predicates over closed-bar indicator values only.
+- [ ] Implement guards as pure functions `(candidate, state) -> {allowed, reason}`; run them before any entry.
+- [ ] Implement layering add logic as pure arithmetic over the position snapshot + config thresholds.
+- [ ] Return risk hints (stop distance via ATR, size weight) for the OMS; never place orders in the core.
+- [ ] Cover every branch with `bun:test`, including a determinism test and a shift/repaint test.
+- [ ] Keep `reason` codes stable so `v3_decision_log` stays queryable.
 
 ## Do / Don't
 **Do**
-- Keep strategy code pure and side-effect free; inject data, return signals.
-- Use `.shift(1)` to reference the *previous* closed value when a rule needs "the prior bar".
-- Confirm the timezone/candle boundary; align all timeframes to the same clock.
-- Version and log the exact parameter set that produced a signal.
+- Keep the core free of `fetch`, Drizzle, `Date.now()`, `Math.random()` — inject them via arguments/config.
+- Decide on the last **closed** candle; treat the polled latest bar as still-forming.
+- Return a `Decision` object with a stable `reason`; let the engine write it to `v3_decision_log`.
+- Encode every threshold in `StrategyConfig` so the optimizer can tune it without code changes.
+- Run guards (news/calendar/BTC-shock/cooldown) before emitting any entry.
 
 **Don't**
-- Don't act on the currently forming candle — it can still reverse before close.
-- Don't use `.shift(-N)`, `.rolling(...).apply` over future rows, `df.max()`/`df.min()` over the whole series, or `resample` that borrows future bars.
-- Don't call Bybit REST/WS from inside strategy logic (breaks testability and idempotency).
-- Don't hardcode symbol quantity/price precision in the strategy — that belongs to execution.
+- Don't inline decision math inside the Bybit engine loop where it can't be unit-tested.
+- Don't read the in-progress candle, use `.slice(-1)` of unconfirmed data, or index future bars.
+- Don't call Bybit or the DB from strategy code — that breaks determinism and the backtester.
+- Don't hardcode symbol tick/qty precision in the core; that is the OMS's job.
+- Don't let a guard depend on wall-clock time directly — pass `now` in as an argument.
 
 ## Common pitfalls
-- **Repainting indicators**: some community indicators (certain SuperTrend/ZigZag/HalfTrend variants, anything centered) recompute past values. Verify by feeding progressively longer slices and checking that historical signal values never change.
-- **Off-by-one warmup**: forgetting to drop the NaN prefix leaks partially-computed indicator values into signals.
-- **Higher-TF leakage**: when merging a 4h trend onto 15m candles, forward-fill so each 15m bar only sees the *last closed* 4h bar, never the current unfinished one (Freqtrade: `merge_informative_pair`).
-- **Fee/slippage blindness**: a strategy that flips every candle can be profitable pre-cost and deeply negative after Bybit taker fees + funding — validate net of costs in the backtester.
-- **Overfitting parameters**: more indicators/thresholds ≠ better; each added knob raises curve-fitting risk. Keep the parameter count small and justify each.
+- **Forming-candle leak.** Acting on the last polled kline before it closes: it backtests perfectly and loses live. Always drop it.
+- **Warmup off-by-one.** Emitting a signal while EMA/RSI is still `undefined`/NaN leaks garbage into rules; gate on `warmup`.
+- **Wilder vs SMA smoothing.** RSI/ATR use Wilder's smoothing, not a simple moving average — using the wrong one shifts thresholds and desyncs backtest from live.
+- **Hidden nondeterminism.** A `Date.now()`, `Math.random()`, or `Object` key-order dependence inside the core makes tests flaky and backtests non-reproducible.
+- **Guard state staleness.** News/calendar scrapers run on their own intervals (news ~3m, calendar ~15m); a guard reading stale rows can wrongly allow/deny. Pass a freshness timestamp and treat stale state as risk-off.
+- **BTC-shock lookahead.** Compute the BTC move from closed bars only; using the current tick makes the guard fire inconsistently.
+- **Over-parameterization.** Every new threshold is another degree of freedom for the optimizer to curve-fit; justify each.
 
 ## Code patterns
-Higher-timeframe trend filter merged safely onto the base timeframe:
+Pure indicators (Wilder RSI/ATR, EMA) in TypeScript — no external deps:
 
-```python
-# htf_df: 4h candles with a computed 'htf_ema' column; base_df: 15m candles
-htf = htf_df[["date", "htf_ema", "close"]].rename(columns={"close": "htf_close"})
-htf["htf_up"] = htf["htf_close"] > htf["htf_ema"]
-# shift the HTF frame so a 15m bar only sees the previous CLOSED 4h bar
-merged = pd.merge_asof(
-    base_df.sort_values("date"),
-    htf[["date", "htf_up"]].sort_values("date"),
-    on="date", direction="backward", allow_exact_matches=False,
-)
-merged["enter_long"] &= merged["htf_up"]
+```ts
+export function ema(values: number[], length: number): (number | undefined)[] {
+  const k = 2 / (length + 1);
+  const out: (number | undefined)[] = [];
+  let prev: number | undefined;
+  values.forEach((v, i) => {
+    if (i + 1 < length) { out.push(undefined); return; }
+    if (prev === undefined) {                       // seed with SMA of first `length`
+      prev = values.slice(i - length + 1, i + 1).reduce((a, b) => a + b, 0) / length;
+    } else {
+      prev = v * k + prev * (1 - k);
+    }
+    out.push(prev);
+  });
+  return out;
+}
+
+export function rsiWilder(close: number[], length = 14): (number | undefined)[] {
+  const out: (number | undefined)[] = [undefined];
+  let avgGain = 0, avgLoss = 0;
+  for (let i = 1; i < close.length; i++) {
+    const ch = close[i] - close[i - 1];
+    const gain = Math.max(ch, 0), loss = Math.max(-ch, 0);
+    if (i <= length) {                              // seed averages
+      avgGain += gain / length; avgLoss += loss / length;
+      out.push(i === length ? 100 - 100 / (1 + avgGain / (avgLoss || 1e-12)) : undefined);
+    } else {
+      avgGain = (avgGain * (length - 1) + gain) / length;
+      avgLoss = (avgLoss * (length - 1) + loss) / length;
+      out.push(100 - 100 / (1 + avgGain / (avgLoss || 1e-12)));
+    }
+  }
+  return out;
+}
 ```
 
-Repaint check (historical signals must be stable as more data arrives):
+Pure strategy core + guards + layering (deterministic, no side effects):
 
-```python
-full = signals(df)
-sliced = signals(df.iloc[: len(df) // 2])
-assert full["enter_long"].iloc[: len(sliced)].equals(sliced["enter_long"]), "repainting!"
+```ts
+export type Candle = { start: number; open: number; high: number; low: number; close: number; volume: number };
+export type Decision =
+  | { action: "hold" | "enterLong" | "enterShort" | "close"; reason: string; stopDist?: number; sizeWeight?: number }
+  | { action: "addLayer"; reason: string; layer: number };
+
+export interface StrategyConfig {
+  emaFast: number; emaSlow: number; rsiLen: number; rsiFloor: number; atrLen: number;
+  layerDrawdownPct: number; maxLayers: number;
+}
+export interface GuardState {
+  now: number; newsScore: number; newsAsOf: number;
+  calendarBlockedUntil: number; btcMovePct: number; cooldownUntil: number;
+}
+
+// Pure predicate: returns the first guard that vetoes, or null if allowed.
+export function guardEntry(g: GuardState, cfg: { newsFloor: number; btcShockPct: number; staleMs: number }): string | null {
+  if (g.now - g.newsAsOf > cfg.staleMs) return "guard:news_stale";      // stale => risk-off
+  if (g.newsScore < cfg.newsFloor) return "guard:news";
+  if (g.now < g.calendarBlockedUntil) return "guard:calendar";
+  if (Math.abs(g.btcMovePct) >= cfg.btcShockPct) return "guard:btc_shock";
+  if (g.now < g.cooldownUntil) return "guard:cooldown";
+  return null;
+}
+
+export function decide(
+  candles: Candle[], cfg: StrategyConfig, g: GuardState,
+  pos: { size: number; avgPrice: number; layers: number } | null,
+): Decision {
+  const closed = candles.slice(0, -1);                 // drop the still-forming polled bar
+  const warmup = Math.max(cfg.emaSlow, cfg.rsiLen, cfg.atrLen);
+  if (closed.length <= warmup) return { action: "hold", reason: "warmup" };
+
+  const close = closed.map((c) => c.close);
+  const f = ema(close, cfg.emaFast).at(-1)!;
+  const s = ema(close, cfg.emaSlow).at(-1)!;
+  const r = rsiWilder(close, cfg.rsiLen).at(-1)!;
+  const atr = /* wilder ATR of high/low/close */ 0;    // see rsiWilder pattern
+  const last = close.at(-1)!;
+
+  if (pos && pos.size > 0) {                            // manage / layer an existing long
+    const drawdown = (pos.avgPrice - last) / pos.avgPrice;
+    if (f < s) return { action: "close", reason: "signal:ema_flip" };
+    if (drawdown >= cfg.layerDrawdownPct && pos.layers < cfg.maxLayers)
+      return { action: "addLayer", reason: "katman:drawdown", layer: pos.layers + 1 };
+    return { action: "hold", reason: "in_position" };
+  }
+
+  const bullish = f > s && r > cfg.rsiFloor;
+  if (!bullish) return { action: "hold", reason: "no_signal" };
+  const veto = guardEntry(g, { newsFloor: -0.3, btcShockPct: 3, staleMs: 10 * 60_000 });
+  if (veto) return { action: "hold", reason: veto };
+  return { action: "enterLong", reason: "signal:ema_cross+rsi", stopDist: 2 * atr, sizeWeight: 1 };
+}
+```
+
+Determinism + repaint test with `bun:test`:
+
+```ts
+import { test, expect } from "bun:test";
+
+test("decide is deterministic", () => {
+  const a = decide(candles, cfg, guard, null);
+  const b = decide(structuredClone(candles), cfg, structuredClone(guard), null);
+  expect(a).toEqual(b);
+});
+
+test("historical decisions are stable as more candles arrive (no repaint)", () => {
+  const full = decide(candles, cfg, guard, null);
+  const past = decide(candles.slice(0, -1), cfg, guard, null); // one fewer future bar
+  expect(past.reason).toBe(full.reason);                       // adding a future bar must not change the past
+});
 ```
 
 ## References
-- [Strategy Customization — Freqtrade](https://www.freqtrade.io/en/stable/strategy-customization/) — populate_indicators/entry/exit, startup_candle_count, common look-ahead mistakes.
-- [Advanced Strategy — Freqtrade](https://www.freqtrade.io/en/stable/strategy-advanced/) — informative (multi-timeframe) pairs, custom stoploss, callbacks.
-- [Lookahead analysis — Freqtrade](https://www.freqtrade.io/en/stable/lookahead-analysis/) — automated detection of future-data leaks in a strategy.
-- [Recursive analysis — Freqtrade](https://www.freqtrade.io/en/stable/recursive-analysis/) — detects indicator values that vary with history length (repainting).
-- [pandas-ta on PyPI](https://pypi.org/project/pandas-ta/) — 130+ indicator pandas extension, install and usage.
-- [pandas-ta documentation](https://www.pandas-ta.dev/) — indicator reference and the three calling styles (standard, DataFrame extension, Strategy).
-- [TA-Lib Python docs](https://ta-lib.github.io/ta-lib-python/) — Function API, Abstract API, install notes.
-- [TA-Lib supported functions](https://ta-lib.github.io/ta-lib-python/funcs.html) — full list of 150+ indicators and their parameters.
-- [TA-Lib GitHub](https://github.com/TA-Lib/ta-lib-python) — source, wheels, install troubleshooting for the native C dependency.
-- [Jesse — crypto trading framework](https://jesse.trade/) — strategy syntax, 300+ indicators, backtest without look-ahead.
-- [Jesse GitHub](https://github.com/jesse-ai/jesse) — reference implementation of strategy/indicator separation.
+- [Bun — Test runner (`bun:test`)](https://bun.com/docs/test) — Jest-style `test`/`expect`/`describe`, watch mode, TS support for the pure-core unit tests.
+- [Bun — Documentation](https://bun.com/docs) — runtime, TypeScript execution, and package layout for a Turborepo package.
+- [Turborepo — Introduction](https://turborepo.dev/docs) — monorepo `apps/`+`packages/` structure that hosts the pure core separately from the engine.
+- [Zod — Introduction](https://zod.dev/) — validate `StrategyConfig` at the shell boundary before it reaches the core.
+- [Zod — Defining schemas](https://zod.dev/api) — `z.infer`, `.safeParse` for typed config parsing.
+- [Drizzle ORM — MySQL get started](https://orm.drizzle.team/docs/mysql/get-started-mysql) — how the shell reads strategy config and writes `v3_decision_log`.
+- [Bybit V5 — Get Kline](https://bybit-exchange.github.io/docs/v5/market/kline) — kline array order `[start,open,high,low,close,volume,turnover]`, newest-first, confirm handling.
+- [Bybit V5 — Get Instruments Info](https://bybit-exchange.github.io/docs/v5/market/instrument) — tick/qty precision the OMS applies to the core's size/stop hints.
+- [Bybit V5 — Introduction](https://bybit-exchange.github.io/docs/v5/intro) — categories, one-way vs hedge (`positionIdx`) context for entries.
+- [Google Gemini API — Docs](https://ai.google.dev/gemini-api/docs) — the news-sentiment source feeding the news guard's score.

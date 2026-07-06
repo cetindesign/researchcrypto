@@ -1,133 +1,172 @@
 ---
 name: realtime-trading-dashboard
-description: Building the live monitoring UI for a multi-bot crypto trading platform with TradingView Lightweight Charts — candlestick/line/histogram series, trade markers (entries/exits) on the chart, streaming live PnL/positions/orders/fills over a WebSocket from the FastAPI backend, high-frequency updates without re-render storms (series.update vs setData), orderbook/depth display, and low-latency rendering. Invoke when the task mentions Lightweight Charts, TradingView charts, candlestick chart, "series markers", live PnL/positions/orders panel, WebSocket to frontend, "chart not updating"/re-render lag, orderbook/depth ladder, streaming updates, or connecting the dashboard to the FastAPI `/ws` endpoint.
+description: Building the live monitoring UI for a multi-bot Bybit trading platform — React 19 + Vite + TanStack Router + TanStack Query + Tailwind v4, consuming the backend tRPC v11 API through the typed @trpc/tanstack-react-query integration. Because there is NO WebSocket, live PnL/positions/orders/decision-log come from TanStack Query POLLING (refetchInterval), not a socket. Covers sensible refetch intervals per data type, dynamic/adaptive polling, optimistic updates for config toggles, TradingView Lightweight Charts v5 fed from query data (setData once, update() thereafter), and avoiding re-render storms. Invoke when the task mentions the trading dashboard/panel, tRPC React hooks, refetchInterval polling, live PnL/positions panel, Lightweight Charts/candlestick chart, optimistic UI, TanStack Router pages, Tailwind v4, or "chart not updating"/re-render lag.
 ---
 
-# Realtime Trading Dashboard (TradingView Lightweight Charts)
+# Realtime Trading Dashboard (React 19 + TanStack + tRPC, polling)
 
 ## When to use this skill
-- Building or debugging the live chart: candlesticks, volume histogram, plotting bot trade entries/exits as markers.
-- Streaming PnL, open positions, orders, and fills into UI panels over a WebSocket from the backend.
-- Fixing performance issues: janky updates, re-render storms, memory growth, dropped frames under fast ticks.
-- Rendering an orderbook / depth ladder that updates many times per second.
-- Wiring the dashboard to the FastAPI WebSocket endpoint (auth, reconnect, backpressure).
+- Building or extending panel pages (positions, orders, PnL, decision log, bot config) with TanStack Router + TanStack Query.
+- Wiring the UI to the backend via the typed tRPC React Query hooks and choosing `refetchInterval` per data type.
+- Making live-ish updates work **without a WebSocket** — everything is HTTP polling of the tRPC API.
+- Adding optimistic UI for config edits / enabling-disabling a bot slot, with rollback on error.
+- Rendering candlestick/PnL charts with TradingView Lightweight Charts v5 fed from polled query data.
+- Fixing performance: re-render storms, janky charts, too-aggressive polling burning the shared rate-limit budget.
 
 ## Core concepts
-- **Chart / series model**: `createChart(container, options)` returns a chart; you `addSeries(CandlestickSeries, opts)` (v5 API) or the older `addCandlestickSeries()`/`addLineSeries()`/`addHistogramSeries()` (v4). Time is UNIX seconds (`UTCTimestamp`) or `'yyyy-mm-dd'` business-day strings — be consistent.
-- **`setData()` vs `update()`**: `setData(array)` **replaces the entire dataset** — use it once for history/backfill. `update(point)` appends a new bar or **mutates the most recent bar in place** (same `time` = replace last, newer `time` = new bar). During live streaming call `update()` per tick; calling `setData()` on every tick is the #1 cause of re-render storms and GC churn.
-- **Markers**: in v5, `createSeriesMarkers(series, markers[])` (v4: `series.setMarkers(...)`). Each marker: `{ time, position: 'aboveBar'|'belowBar'|'inBar', color, shape: 'arrowUp'|'arrowDown'|'circle'|'square', text }`. For candlesticks you only need `time` + `position`; the marker anchors to the bar's high/low. Use markers for bot entries (green arrowUp belowBar) and exits (red arrowDown aboveBar). Markers must stay sorted by `time`.
-- **Panes / multi-series**: overlay volume as a histogram on its own price scale (`priceScaleId: ''` + scale margins); keep PnL equity curve as a separate line series or separate chart.
-- **Rendering**: canvas-based (not DOM/SVG), so it absorbs rapid updates far better than DOM chart libs; the library also manages viewport shifts on new bars.
+- **No socket — polling is the live channel.** The backend is polling REST against Bybit (no WS anywhere). The UI mirrors that: TanStack Query's `refetchInterval` re-runs a query every N ms while a component observes it. `refetchInterval` is independent of `staleTime` — it fires on its own clock. Pick intervals to match how fast the underlying data actually changes and the server's own tick.
+- **Typed tRPC hooks.** With `@trpc/tanstack-react-query`, `trpc.positions.list.queryOptions()` returns a fully typed options object you pass to `useQuery`; `trpc.configs.update.mutationOptions()` for `useMutation`. Query keys are derived from the tRPC path, so cache invalidation is type-safe (`queryClient.invalidateQueries(trpc.positions.list.queryFilter())`).
+- **Interval budget.** Every poll is a real HTTP call that may fan out to a DB read (or, worst case, a signed Bybit call server-side). Fast panels (PnL, positions) ~3-5s; orders ~5s; decision/event log ~15-30s; slow/static config ~on-demand only. Use `refetchIntervalInBackground: false` (default) so hidden tabs stop polling.
+- **Adaptive polling.** `refetchInterval` accepts a function `(query) => number | false` — slow down or stop when there's nothing to watch (no open positions → 30s; an active fill in flight → 2s), and stop entirely (`false`) on error to avoid hammering a failing endpoint.
+- **Optimistic updates.** For config toggles, use `useMutation` with `onMutate` (cancel in-flight queries, snapshot cache, `setQueryData` optimistically), `onError` (roll back to snapshot), `onSettled` (invalidate to reconcile with server truth). Remember the engine only *acts* on the change on its next 10s turn — reflect "pending" state, don't imply the position changed instantly.
+- **Charts are imperative, not React state.** Lightweight Charts v5: `createChart(el)` then `chart.addSeries(CandlestickSeries, opts)`. Load history **once** with `series.setData(array)`; apply new/updated bars with `series.update(point)`. Drive the chart from a `useRef` + effect that reads query data — never store bar arrays in React state and re-render per tick.
 
-## Python & stack specifics
-- **Backend feed**: the FastAPI backend (see `backend-api-service` skill) exposes `/ws/live`. Bot/market data ultimately comes from Bybit V5 (kline + private position/order/execution streams via `pybit`/`ccxt.pro`); the backend normalizes it and pushes compact JSON frames to the browser. Don't connect the browser directly to Bybit with API keys — proxy through the backend.
-- **Message shape**: use a tagged envelope, e.g. `{ "type": "kline"|"pnl"|"position"|"order"|"fill"|"depth", "data": {...} }`, so the client dispatches to the right handler. Send **closed** candles for history and a single "current forming" candle you keep `update()`-ing until it closes.
-- **Bybit kline → chart point**: map `{ start, open, high, low, close, volume }` to `{ time: start/1000, open, high, low, close }` (seconds, not ms). Bybit timestamps are milliseconds — divide by 1000.
-- **Depth**: Bybit `orderbook.<depth>.<symbol>` sends a snapshot then deltas; maintain the book in JS (apply deltas by price level, drop levels with size 0) and render the ladder yourself — Lightweight Charts is for time series, not the depth ladder.
-- **Frontend**: install `lightweight-charts` (npm) or use the community Python `lightweight-charts` wrapper for quick internal tools; production dashboards use the JS lib in React/Svelte/vanilla.
+## Codebase specifics (React 19 / Vite / TanStack / Tailwind v4)
+- **Stack:** React 19 + Vite (dev/build), TanStack Router for type-safe file/route trees, TanStack Query as the server-state cache, Tailwind v4 for styling, tRPC client for the API. All TypeScript strict. The web app is a Turborepo `apps/` package; it imports the backend's `AppRouter` **type** for end-to-end typing.
+- **Data sources (all tRPC queries, polled):** `positions.list`, `orders.list`, `bots.pnl`, `configs.get`, `logs.decisions` (the `v3_decision_log`), `logs.events` (the `v3_position_event` audit trail). The server reconciles Bybit → DB; the UI reads the reconciled ledger, so it never talks to Bybit directly and never holds API keys.
+- **tRPC client setup:** `createTRPCContext<AppRouter>()` gives a `TRPCProvider`; wrap the app with it plus a shared `QueryClient`/`QueryClientProvider`. The httpBatchLink points at the Hono `/trpc` endpoint with `credentials: 'include'` so the Better-Auth session cookie rides along.
+- **Router + auth guard:** protected routes use a TanStack Router `beforeLoad` that checks the session query and redirects to the Google/email login when unauthenticated. Route params/search are type-checked by the compiler.
+- **Tailwind v4:** installed via `@tailwindcss/vite` plugin; a single `@import "tailwindcss";` in the entry CSS (no `tailwind.config.js`, no PostCSS). Theme tokens (colors for up/down, PnL green/red) live in a `@theme { --color-... }` block and are emitted as both CSS vars and utilities.
+- **Pending-vs-actual semantics:** because the engine is a 10s loop, an optimistic toggle should show "queued" until the next `configs.get` / `logs.events` poll confirms the engine applied it. Don't fake instant fills.
 
 ## Implementation checklist
-- [ ] Create chart with `autoSize` (or a ResizeObserver) so it fills its container and survives layout changes.
-- [ ] Backfill history once via REST → `candleSeries.setData(history)`; then switch to live `update()`.
-- [ ] Open one WebSocket to the backend; authenticate (token in first message or query); dispatch by `type`.
-- [ ] On each `kline` frame, `candleSeries.update(point)` — never `setData` per tick.
-- [ ] Batch non-chart UI state (PnL/positions/orders) and flush on `requestAnimationFrame` to avoid React re-render storms.
-- [ ] Add trade markers via `createSeriesMarkers`; keep the marker array sorted and bounded (prune old ones).
-- [ ] Maintain the orderbook from snapshot+delta; render the ladder in a separate throttled component.
-- [ ] Implement reconnect with exponential backoff + jitter; on reconnect, re-backfill the last bars to fill gaps.
-- [ ] Show a connection/latency indicator (compare server send-timestamp to client receive-time).
-- [ ] Clean up on unmount: `chart.remove()`, close the socket, cancel timers/RAF.
+- [ ] Wrap the app in `QueryClientProvider` + tRPC `TRPCProvider`; httpBatchLink → `/trpc` with `credentials:'include'`.
+- [ ] Set per-query `refetchInterval`: PnL/positions 3-5s, orders 5s, logs 15-30s, config on-demand.
+- [ ] Use adaptive `refetchInterval` functions to slow/stop when idle and stop on error.
+- [ ] Leave `refetchIntervalInBackground` default (off) so hidden tabs don't poll.
+- [ ] Optimistic `useMutation` for config/slot toggles: `onMutate` cancel+snapshot+set, `onError` rollback, `onSettled` invalidate.
+- [ ] Show a "pending / applied on next engine tick" state; confirm via the next poll, not instantly.
+- [ ] Chart: `createChart` in a ref effect; `setData(history)` once; `update(point)` from newest polled bar; `chart.remove()` on unmount.
+- [ ] Derive chart bars from query data in an effect; keep them out of React state to avoid re-render storms.
+- [ ] TanStack Router `beforeLoad` auth guard; redirect to login when the session query is empty.
+- [ ] Tailwind v4 via `@tailwindcss/vite` + `@import "tailwindcss";`; theme colors in `@theme`.
+- [ ] A staleness/last-updated indicator (compare `dataUpdatedAt` to now) so users know polling is alive.
 
 ## Do / Don't
 **Do**
-- Use `series.update()` for every live tick and `setData()` only for initial/bulk loads.
-- Coalesce bursts: if messages arrive faster than frames, keep only the latest per symbol and paint once per frame.
-- Keep marker/PnL arrays bounded; unbounded growth leaks memory over a trading day.
-- Proxy market data through the backend; keep exchange API keys server-side only.
-- Reconnect with backoff and re-sync history to cover the gap during the disconnect.
+- Match `refetchInterval` to real change-rate and the server's 10s engine cadence; poll slower for logs.
+- Use the typed `queryOptions`/`mutationOptions` factories and `invalidateQueries` with tRPC query filters.
+- Feed charts imperatively (`setData` once, then `update`); read query data via refs.
+- Reconcile optimistic UI on `onSettled` by invalidating the affected tRPC query.
+- Stop or back off polling on error and when panels are idle/hidden.
 
 **Don't**
-- Don't call `setData()` on every WebSocket message — it re-ingests the whole series and stutters.
-- Don't call `setState`/re-render per message in React; batch and use refs/imperative chart API.
-- Don't feed millisecond timestamps where the lib expects seconds — bars land in 1970 or scatter.
-- Don't push unsorted or out-of-order markers/data — updates get rejected or misplaced.
-- Don't hold the WebSocket in component state so every frame re-renders the tree.
+- Don't reach for a WebSocket — there is none; add polling, not a socket layer.
+- Don't set 500ms-1s intervals on everything; it multiplies HTTP/DB load and the shared Bybit rate budget.
+- Don't `setData()` the whole series on every poll — use `update()` for the latest bar.
+- Don't store bar arrays / positions in React state and re-render the chart tree each tick.
+- Don't imply an optimistic toggle changed the live position — the engine applies it on its next turn; show "pending".
+- Don't fetch Bybit or hold API keys in the browser; always go through the tRPC API.
 
 ## Common pitfalls
-- **Re-render storms**: driving a canvas chart through React state on every tick — bypass React for the hot path and mutate the series imperatively.
-- **ms vs s timestamps**: Bybit sends ms; the chart wants seconds — the most common "nothing shows up" bug.
-- **Gap after reconnect**: live-only `update()` loses bars during a disconnect; always re-backfill on reconnect.
-- **Unbounded memory**: never pruning markers/points or old depth levels causes steady memory growth and slowdowns.
-- **Order-book drift**: applying deltas without honoring the snapshot sequence / not removing zero-size levels desyncs the ladder from the exchange.
-- **Multiple chart instances**: forgetting `chart.remove()` on route change leaks canvases and event listeners.
+- **Polling too hard:** aggressive `refetchInterval` across many panels saturates the single backend process and the exchange rate-limit budget; stagger and slow down.
+- **`setData` per poll:** re-ingesting the full candle history each interval causes chart stutter and GC churn — `update()` the newest bar instead.
+- **Chart in React state:** driving the canvas through `useState` re-renders the component tree on every poll; use refs + effects.
+- **Optimistic without rollback:** `onMutate` mutating the cache but no `onError` snapshot restore leaves the UI lying after a failed mutation.
+- **Instant-fill illusion:** treating an optimistic config change as an executed trade — the 10s engine hasn't acted yet; label it pending.
+- **ms vs seconds on the chart:** Bybit/DB timestamps are milliseconds; Lightweight Charts wants UNIX **seconds** — divide by 1000 or bars land in 1970.
+- **Background polling drain:** forgetting hidden tabs keep polling if `refetchIntervalInBackground` is on.
 
 ## Code patterns
-```javascript
-import { createChart, CandlestickSeries, HistogramSeries, createSeriesMarkers } from 'lightweight-charts';
+```tsx
+// polling live panels via typed tRPC hooks (no WebSocket)
+import { useQuery } from '@tanstack/react-query';
+import { useTRPC } from '../trpc';
 
-const chart = createChart(document.getElementById('chart'), { autoSize: true });
-const candles = chart.addSeries(CandlestickSeries, { upColor: '#26a69a', downColor: '#ef5350' });
-const volume = chart.addSeries(HistogramSeries, { priceScaleId: '', priceFormat: { type: 'volume' } });
-volume.priceScale().applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
+function LivePanels() {
+  const trpc = useTRPC();
 
-// 1) history once
-candles.setData(await fetchHistory());               // NOT called again per tick
+  const positions = useQuery(trpc.positions.list.queryOptions(undefined, {
+    refetchInterval: 4_000,          // positions/PnL: a few seconds
+  }));
 
-// 2) live stream from the FastAPI backend WS
-const markers = createSeriesMarkers(candles, []);
-let pending = null, frame = null;
+  const orders = useQuery(trpc.orders.list.queryOptions(undefined, {
+    // adaptive: fast while orders are open, slow when idle, stop on error
+    refetchInterval: (q) =>
+      q.state.status === 'error' ? false : (q.state.data?.length ? 3_000 : 15_000),
+  }));
 
-const ws = new WebSocket(`wss://api.example.com/ws/live?token=${token}`);
-ws.onmessage = (ev) => {
-  const { type, data } = JSON.parse(ev.data);
-  if (type === 'kline') {
-    // Bybit ms -> seconds; same time => replaces the forming bar
-    pending = { time: data.start / 1000, open: +data.open, high: +data.high,
-                low: +data.low, close: +data.close };
-    if (!frame) frame = requestAnimationFrame(() => {   // coalesce to one paint/frame
-      if (pending) candles.update(pending);
-      pending = null; frame = null;
-    });
-  } else if (type === 'fill') {
-    appendMarker({ time: data.ts / 1000,
-      position: data.side === 'Buy' ? 'belowBar' : 'aboveBar',
-      color: data.side === 'Buy' ? '#26a69a' : '#ef5350',
-      shape: data.side === 'Buy' ? 'arrowUp' : 'arrowDown',
-      text: `${data.side} ${data.qty}` });
-  } else if (type === 'pnl' || type === 'position' || type === 'order') {
-    queuePanelUpdate(type, data);   // batch panel state, flush on RAF
-  }
-};
+  const decisions = useQuery(trpc.logs.decisions.queryOptions(
+    { limit: 50 }, { refetchInterval: 20_000 }, // audit log changes slowly
+  ));
 
-let sorted = [];
-function appendMarker(m) {
-  sorted.push(m);
-  sorted.sort((a, b) => a.time - b.time);   // markers must be time-sorted
-  if (sorted.length > 500) sorted = sorted.slice(-500);  // bound memory
-  markers.setMarkers(sorted);
+  return /* render tables; show positions.dataUpdatedAt as "last updated" */ null;
 }
 ```
 
-```javascript
-// Reconnect with backoff + gap re-sync
-function connect(attempt = 0) {
-  const ws = new WebSocket(url);
-  ws.onclose = () => {
-    const delay = Math.min(30000, 2 ** attempt * 1000) + Math.random() * 500;
-    setTimeout(() => { backfillRecentBars().then(() => connect(attempt + 1)); }, delay);
-  };
-  ws.onopen = () => { attempt = 0; ws.send(JSON.stringify({ auth: token })); };
-  return ws;
+```tsx
+// optimistic config toggle — engine applies it on its next 10s turn
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useTRPC } from '../trpc';
+
+function useToggleBot(configId: string) {
+  const trpc = useTRPC();
+  const qc = useQueryClient();
+  const key = trpc.configs.get.queryOptions({ configId }).queryKey;
+
+  return useMutation(trpc.configs.update.mutationOptions({
+    onMutate: async (vars) => {
+      await qc.cancelQueries({ queryKey: key });
+      const prev = qc.getQueryData(key);
+      qc.setQueryData(key, (o: any) => ({ ...o, enabled: vars.enabled, pending: true }));
+      return { prev };
+    },
+    onError: (_e, _v, ctx) => ctx && qc.setQueryData(key, ctx.prev), // rollback
+    onSettled: () => qc.invalidateQueries({ queryKey: key }),        // reconcile w/ server
+  }));
+}
+```
+
+```tsx
+// Lightweight Charts v5: setData once, update() from polled data, no re-render storm
+import { useEffect, useRef } from 'react';
+import { createChart, CandlestickSeries, type IChartApi, type ISeriesApi } from 'lightweight-charts';
+import { useQuery } from '@tanstack/react-query';
+import { useTRPC } from '../trpc';
+
+export function CandleChart({ symbol }: { symbol: string }) {
+  const el = useRef<HTMLDivElement>(null);
+  const series = useRef<ISeriesApi<'Candlestick'>>();
+  const chart = useRef<IChartApi>();
+  const trpc = useTRPC();
+
+  const klines = useQuery(trpc.market.klines.queryOptions({ symbol }, { refetchInterval: 5_000 }));
+
+  useEffect(() => {
+    if (!el.current) return;
+    chart.current = createChart(el.current, { autoSize: true });
+    series.current = chart.current.addSeries(CandlestickSeries, {
+      upColor: '#26a69a', downColor: '#ef5350',
+    });
+    return () => chart.current?.remove();          // cleanup: no leaked canvases
+  }, []);
+
+  useEffect(() => {
+    const rows = klines.data;
+    if (!rows?.length || !series.current) return;
+    // ms -> seconds; setData once to backfill, update() the latest bar thereafter
+    const bars = rows.map((r) => ({ time: r.start / 1000, open: +r.open, high: +r.high,
+      low: +r.low, close: +r.close }));
+    if (!series.current.data().length) series.current.setData(bars as any);
+    else series.current.update(bars[bars.length - 1] as any);
+  }, [klines.data]);
+
+  return <div ref={el} style={{ height: 400 }} />;
 }
 ```
 
 ## References
-- [Lightweight Charts — Getting started](https://tradingview.github.io/lightweight-charts/docs) — install, create chart, add series, load data.
-- [Lightweight Charts — Series types](https://tradingview.github.io/lightweight-charts/docs/series-types) — candlestick, line, histogram, area configuration.
-- [Lightweight Charts — Add series markers](https://tradingview.github.io/lightweight-charts/tutorials/how_to/series-markers) — plotting trade entry/exit markers.
-- [Lightweight Charts — Realtime updates demo](https://tradingview.github.io/lightweight-charts/tutorials/demos/realtime-updates) — streaming with `update()`.
-- [Lightweight Charts — API reference](https://tradingview.github.io/lightweight-charts/docs/api) — full API: `setData`, `update`, marker/series interfaces.
-- [lightweight-charts on GitHub](https://github.com/tradingview/lightweight-charts) — source, changelog, v4→v5 migration.
-- [FastAPI — WebSockets](https://fastapi.tiangolo.com/advanced/websockets/) — backend WebSocket endpoint the dashboard connects to.
-- [Bybit V5 — WebSocket public (kline)](https://bybit-exchange.github.io/docs/v5/ws/connect) — market-data streams feeding the chart.
-- [Bybit V5 — Private order stream](https://bybit-exchange.github.io/docs/v5/websocket/private/order) — order/fill events surfaced as markers/panels.
+- [TanStack Query — Polling / refetchInterval](https://tanstack.com/query/latest/docs/framework/react/guides/polling) — timer-based refetch, background polling.
+- [TanStack Query — useQuery reference](https://tanstack.com/query/v5/docs/framework/react/reference/useQuery) — `refetchInterval`, `refetchIntervalInBackground`, `dataUpdatedAt`.
+- [TanStack Query — Optimistic updates](https://tanstack.com/query/v5/docs/framework/react/guides/optimistic-updates) — `onMutate`/`onError`/`onSettled`, cache snapshot & rollback.
+- [TanStack Query — Important defaults](https://tanstack.com/query/v5/docs/framework/react/guides/important-defaults) — staleTime vs refetch behavior.
+- [tRPC — TanStack React Query setup](https://trpc.io/docs/client/tanstack-react-query/setup) — `@trpc/tanstack-react-query`, `queryOptions`/`mutationOptions` factories.
+- [@trpc/tanstack-react-query (npm)](https://www.npmjs.com/package/@trpc/tanstack-react-query) — the typed React Query integration package.
+- [TanStack Router — Creating a router](https://tanstack.com/router/latest/docs/guide/creating-a-router) — `createRouter`, type registration.
+- [TanStack Router — File-based routing](https://tanstack.com/router/latest/docs/routing/file-based-routing) — route tree, `__root`, dynamic params.
+- [Tailwind CSS v4 — Vite install](https://tailwindcss.com/docs/installation/using-vite) — `@tailwindcss/vite`, `@import "tailwindcss";`.
+- [Tailwind CSS v4.0 announcement](https://tailwindcss.com/blog/tailwindcss-v4) — CSS-first `@theme` config, no `tailwind.config.js`.
+- [Lightweight Charts — Getting started](https://tradingview.github.io/lightweight-charts/docs) — `createChart`, `addSeries`, `setData`, `update`.
+- [Lightweight Charts — React example](https://tradingview.github.io/lightweight-charts/tutorials/react/simple) — chart in a ref + effect, cleanup.
+- [Lightweight Charts — v4 → v5 migration](https://tradingview.github.io/lightweight-charts/docs/migrations/from-v4-to-v5) — `addSeries(CandlestickSeries, …)` API.
+- [Lightweight Charts — Series types](https://tradingview.github.io/lightweight-charts/docs/series-types) — candlestick/line/histogram config.

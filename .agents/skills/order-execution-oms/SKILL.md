@@ -1,140 +1,164 @@
 ---
 name: order-execution-oms
-description: Order execution and an Order Management System (OMS) for Bybit V5 perpetuals in Python — order types (Market, Limit, conditional/stop, TP/SL, reduce-only, post-only), time-in-force (GTC/IOC/FOK/PostOnly), placing/amending/cancelling orders, orderLinkId for client idempotency, partial fills, reject/retry handling with exponential backoff, avoiding duplicate orders on retry, one-way vs hedge position mode, and leverage. Invoke when the user mentions "place/amend/cancel order", "Bybit order", "orderLinkId", "reduce-only", "post-only", "time in force", "stop/conditional order", "TP/SL", "partial fill", "retry/backoff", "duplicate order", "position mode", "hedge mode", "set leverage", "pybit", or "ccxt create_order".
+description: Order execution against Bybit V5 linear perps in TypeScript (Bun) for the v3 engine's dirty shell — placing MARKET entries and reduce-only MARKET closes (the platform enters AND exits with MARKET; TP/SL/trailing are evaluated in software then closed with a MARKET order), signed REST via fetch + HMAC-SHA256 (X-BAPI headers, recv_window), orderLinkId idempotency, retry/backoff without duplicate orders, one-way vs hedge (positionIdx), set-leverage, qtyStep/tickSize rounding, and writing every action to v3_decision_log / v3_position_event with the exchange as the source of truth (reconcile). Polling only — there is NO WebSocket order stream; fill/position state comes from signed REST. Invoke when the user mentions "place/close order", "MARKET order", "reduce-only", "orderLinkId", "idempotency", "retry/backoff", "duplicate order", "reconcile", "positionIdx", "hedge mode", "set leverage", "trading stop", "v3_position_event", "HMAC sign Bybit", "recv_window", or "OMS".
 ---
 
 # Order Execution & OMS
 
 ## When to use this skill
-- Placing, amending, or cancelling orders on Bybit V5 (Market, Limit, conditional/stop, TP/SL).
-- Choosing time-in-force (GTC/IOC/FOK/PostOnly) and flags (reduce-only, post-only, close-on-trigger).
-- Making order submission idempotent so a network retry never doubles a position.
-- Handling partial fills, rejects, and rate limits with safe retry/backoff.
-- Configuring position mode (one-way vs hedge) and leverage before trading.
-- Building the OMS layer that sits between strategy signals and the exchange.
+- Placing a MARKET entry or a reduce-only MARKET close against Bybit V5 from the v3 engine shell.
+- Signing Bybit V5 REST requests in TypeScript (`fetch` + `crypto` HMAC-SHA256, X-BAPI headers).
+- Making order submission idempotent so a polling retry or timeout never doubles a position.
+- Closing a position when the in-software TP/SL/trailing check trips (no exchange-side TP order needed).
+- Configuring one-way vs hedge (`positionIdx`) and leverage once at startup.
+- Reconciling the DB ledger against real exchange positions and writing `v3_position_event` audit rows.
 
 ## Core concepts
-- **Order types (Bybit V5)**: `Market` (fill now, taker) and `Limit` (rest at a price). Conditional/**stop** orders arm on a `triggerPrice` and then submit as market/limit. **TP/SL** can be attached to a position (Set Trading Stop) or as reduce-only exits.
-- **Time-in-force**: `GTC` (rest until filled/cancelled), `IOC` (fill what's possible now, cancel the rest), `FOK` (fill entirely now or cancel), `PostOnly` (maker-only — Bybit cancels the order if it would execute immediately, guaranteeing the maker fee).
-- **reduceOnly**: an order that can only shrink/close a position, never flip or increase it. Essential for exits so a stale exit can't accidentally open a new position.
-- **closeOnTrigger**: prioritizes closing during volatile/deleverage conditions (may cancel other orders to free margin).
-- **orderLinkId**: your client-supplied unique id (≤ 36 chars). It is the backbone of **idempotency** — reuse the same orderLinkId on a retry and Bybit rejects the duplicate instead of placing a second order.
-- **Partial fill**: a limit order can fill in pieces; track `cumExecQty` vs `qty`, and reconcile from the order/execution stream, not from your assumption.
-- **Position mode**: **one-way** (one net position per symbol, `positionIdx=0`) vs **hedge** (simultaneous long+short, `positionIdx=1` buy-side / `2` sell-side). Orders must carry the matching `positionIdx`.
-- **Idempotency vs at-least-once**: the network can drop a *response* after the order was accepted. Retrying blindly risks a duplicate; retrying with the same orderLinkId is safe.
+- **MARKET-only execution.** The platform enters and exits with **MARKET** orders (taker). It does NOT rest limit orders or push TP/SL to the exchange as the primary mechanism: TP/SL/trailing are evaluated **in software** each ~10s loop, and when triggered the engine sends a reduce-only MARKET close. Optionally a broker-side stop can be attached via Set Trading Stop as a safety net, but the decision path is software.
+- **reduceOnly for closes.** Every exit carries `reduceOnly: true` so a stale or duplicated close can only shrink/flatten the position — never flip it into an opposite one.
+- **orderLinkId = idempotency key.** A client-supplied unique id (≤ 36 chars). Persist it to `v3_decision_log`/`v3_position_event` **before** sending. On any retry, reuse the *same* orderLinkId; Bybit rejects the duplicate instead of placing a second order. This is the backbone of safe retries under a polling architecture.
+- **Polling, not streaming.** There is NO WebSocket order/execution stream. Fill state and positions are read with signed REST (`/v5/order/realtime`, `/v5/position/list`). Design around interval polling, timeouts, backoff, and rate-limit budgets — not push events.
+- **Exchange = source of truth; DB = ledger.** After acting, read the real position back from Bybit and reconcile the DB to it. Never trust optimistic local state; a timed-out response does not mean the order failed.
+- **Position mode.** One-way (`positionIdx: 0`, one net position/symbol) is the platform default; hedge mode uses `1` (buy side) / `2` (sell side). Orders must carry the matching `positionIdx`.
+- **Idempotency vs at-least-once.** The network can drop a *response* after Bybit accepted the order. Blind retry → duplicate; retry with the same orderLinkId (and a status check first) → safe.
 
-## Bybit / Python specifics
-Endpoints (V5, one endpoint serves spot/linear/inverse/option via `category`):
-- Place: `POST /v5/order/create` — key params: `category` (`linear` for USDT perps), `symbol`, `side` (`Buy`/`Sell`), `orderType` (`Market`/`Limit`), `qty`, `price`, `timeInForce`, `orderLinkId`, `reduceOnly`, `positionIdx`, `triggerPrice`, `triggerDirection`, `triggerBy`, `takeProfit`, `stopLoss`, `tpTriggerBy`, `slTriggerBy`, `tpslMode`.
-- Amend: `POST /v5/order/amend` — change price/qty/trigger by `orderId` or `orderLinkId` (cheaper and less risky than cancel+replace; no loss of queue position semantics vs re-submitting).
-- Cancel: `POST /v5/order/cancel`; `POST /v5/order/cancel-all`.
-- Attach TP/SL to a position: `POST /v5/position/trading-stop` (`takeProfit`, `stopLoss`, `tpslMode` Full/Partial, `tpSize`/`slSize`, `tpLimitPrice`/`slLimitPrice`).
-- Leverage: `POST /v5/position/set-leverage` (`buyLeverage`, `sellLeverage`). Position mode: `POST /v5/position/switch-mode`.
-- Batch: `create-batch` / `amend-batch` / `cancel-batch` (up to 10 for linear).
-
-SDKs:
-- **pybit** (official): `session.place_order(category="linear", symbol="BTCUSDT", side="Buy", orderType="Limit", qty="0.01", price="60000", timeInForce="PostOnly", orderLinkId=uid, reduceOnly=False, positionIdx=0)`; `session.amend_order(...)`, `session.cancel_order(...)`, `session.set_leverage(...)`, `session.switch_position_mode(...)`.
-- **CCXT / CCXT Pro** (`bybit` id): `exchange.create_order(symbol, type, side, amount, price, params={"timeInForce":"PostOnly","reduceOnly":True,"positionIdx":0,"clientOrderId":uid})`. CCXT maps `clientOrderId` → `orderLinkId`; `postOnly=True` and `reduceOnly=True` are unified params.
-
-Key limits/quirks:
-- `orderLinkId` ≤ 36 chars and must be unique per account.
-- If both `orderId` and `orderLinkId` are sent, Bybit uses `orderId`.
-- Round `qty` to `qtyStep`/`minOrderQty` and `price` to `tickSize` from `/v5/market/instrument`, or the order is rejected.
-- Rate limits are per-endpoint; headers `X-Bapi-Limit`, `X-Bapi-Limit-Status`, `X-Bapi-Limit-Reset-Timestamp` report your budget.
-- Prefer the **private WebSocket order/execution stream** for fill state; REST polling is slower and rate-limited.
-
-Error codes worth special-casing:
-- `10006` "Too many visits" — rate limited; back off and retry.
-- `10016` INTERNAL_SERVER_ERROR — transient; retry later.
-- `10001` param error, `110007` insufficient balance, `110043` leverage not modified, `110017`/duplicate-orderLinkId style rejects — do NOT blindly retry these; they're deterministic.
+## Codebase specifics
+- **Language/runtime.** TypeScript + Bun. HTTP via `fetch`; signing via `node:crypto` `createHmac` (Bun implements it). No `pybit`, no CCXT (mention only as an optional alternative).
+- **Signing (Bybit V5).** Header auth: build `sign = HMAC_SHA256(secret, timestamp + apiKey + recvWindow + queryString|body)` and send `X-BAPI-API-KEY`, `X-BAPI-TIMESTAMP`, `X-BAPI-RECV-WINDOW`, `X-BAPI-SIGN`. API keys are stored **AES-256-GCM encrypted in MySQL** and decrypted in-process per request; never log the secret.
+- **Endpoints (category `linear`).** Place: `POST /v5/order/create`; close: same endpoint with `reduceOnly: true`; query: `GET /v5/order/realtime`; positions: `GET /v5/position/list`; safety TP/SL: `POST /v5/position/trading-stop`; leverage: `POST /v5/position/set-leverage`; mode: `POST /v5/position/switch-mode`.
+- **Engine loop order (one ~10s turn):** read active user configs (Drizzle) → fetch real positions (signed REST) → reconcile DB → software TP/SL/trailing check, close with MARKET if tripped → layering (katman) adds → if a slot is free and guards/coin-selector pass, MARKET entry. Each step writes `v3_decision_log`; each fill/close writes `v3_position_event`.
+- **Audit trail.** `v3_decision_log` = why the engine did (or didn't) act, incl. the guard reason; `v3_position_event` = what happened to the position (open/add/close/reconcile), with the orderLinkId and exchange `orderId`.
+- **Rate limits.** Per-endpoint; read `X-Bapi-Limit`, `X-Bapi-Limit-Status`, `X-Bapi-Limit-Reset-Timestamp`. HTTP 403 from Bybit can mean a ~10-minute IP ban — back off hard, don't hammer.
+- **Bybit-only.** No Binance execution paths here.
 
 ## Implementation checklist
-- [ ] Set position mode and leverage once at startup; treat "not modified" as success.
-- [ ] Generate a unique `orderLinkId` per intended order and persist it BEFORE sending.
-- [ ] Round qty/price to the instrument's step/tick; reject sub-minimum orders early.
-- [ ] Send the order; on timeout/5xx/`10006`/`10016`, retry with the **same** orderLinkId + exponential backoff + jitter.
-- [ ] On any retry, first query order status by orderLinkId — if it exists, don't resend.
-- [ ] Classify errors: retry transient (network/rate/5xx), never retry deterministic (bad params, insufficient funds, duplicate).
-- [ ] Track fills via the WS order/execution stream; reconcile `cumExecQty` for partials.
-- [ ] Use `reduceOnly=True` for all exits; carry the correct `positionIdx` in hedge mode.
-- [ ] Prefer `amend` over cancel+create when adjusting a resting order's price/qty.
+- [ ] Set position mode and leverage once at startup; treat "not modified" (`110043`) as success.
+- [ ] Generate + persist a unique `orderLinkId` to `v3_decision_log` BEFORE sending the order.
+- [ ] Round `qty` to `qtyStep`/`minOrderQty` and any price to `tickSize`; format as strings; reject sub-minimum.
+- [ ] Send the MARKET order; on timeout / 5xx / `10006` / `10016`, retry with the SAME orderLinkId + backoff + jitter.
+- [ ] On any retry, first query `/v5/order/realtime` by orderLinkId — if it exists, do NOT resend.
+- [ ] Classify errors: retry transient (network/rate/5xx); never retry deterministic (bad params, insufficient balance, duplicate).
+- [ ] Use `reduceOnly: true` for every close; carry the correct `positionIdx`.
+- [ ] After acting, fetch `/v5/position/list` and reconcile the DB; write `v3_position_event`.
+- [ ] Evaluate TP/SL/trailing in software; close with a reduce-only MARKET order when tripped.
 
 ## Do / Don't
 **Do**
-- Make every order idempotent with a pre-persisted `orderLinkId`.
-- Distinguish transient vs permanent errors and only retry the transient ones.
-- Add jitter to backoff so parallel bots don't retry in lockstep and re-trigger `10006`.
-- Use `PostOnly` when you require the maker fee; expect the order to be cancelled if it would cross.
-- Reconcile actual position/fills from the exchange, not from optimistic local state.
+- Make every order idempotent with a pre-persisted `orderLinkId`; reuse it on retry.
+- Treat the exchange as truth: read positions back and reconcile after each action.
+- Distinguish transient vs permanent errors; only retry the transient ones, with jitter.
+- Use `reduceOnly: true` on all exits and the correct `positionIdx`.
+- Poll fill/position state on an interval with timeouts and a rate-limit budget.
 
 **Don't**
-- Don't retry a failed submit with a fresh orderLinkId — that's how you get duplicate positions.
-- Don't assume a request failed just because the response timed out; check by orderLinkId first.
-- Don't send exits without `reduceOnly` — a delayed exit can open an opposite position.
-- Don't ignore `qtyStep`/`tickSize` rounding or `minOrderQty`/`minNotional`.
-- Don't hammer on `10006`; after repeated rate limits, pause and resume at half speed.
+- Don't retry a failed submit with a fresh orderLinkId — that is how you get a double position.
+- Don't assume a request failed because the response timed out; query by orderLinkId first.
+- Don't send a close without `reduceOnly` — a delayed close can open an opposite position.
+- Don't ignore `qtyStep`/`tickSize`/`minOrderQty`, or pass floats that drift off the step.
+- Don't expect a WebSocket fill event — there is none; reconcile via REST.
+- Don't log the decrypted API secret or the signing string.
 
 ## Common pitfalls
-- **Duplicate orders on retry**: the classic double-fill. Fixed only by stable `orderLinkId` + status-check-before-resend.
-- **PostOnly surprise cancels**: a PostOnly order that would execute is silently cancelled — poll/subscribe or you'll think it's resting when it's gone.
-- **Wrong positionIdx in hedge mode**: order rejected or applied to the wrong side.
-- **Partial-fill accounting**: assuming full fill and then over-sizing the opposite exit. Always read `cumExecQty`.
-- **Reduce-only rejects**: a reduce-only order larger than the remaining position is capped/rejected; size it to current position.
-- **Leverage/mode changes with open positions**: switching position mode requires no open positions/orders on the symbol; `set-leverage` returning "not modified" (110043) is benign.
-- **Clock/qty precision**: floats introduce precision drift; format qty/price as strings at the tick/step to avoid rejects.
+- **Duplicate orders on retry.** The classic double-fill; fixed only by a stable orderLinkId + status-check-before-resend.
+- **Timed-out-but-filled.** A dropped response after acceptance; blindly resending doubles the position. Always reconcile.
+- **Reduce-only over-size.** A reduce-only close larger than the remaining position is capped/rejected — size it to the *current* exchange position, not local assumption.
+- **Wrong positionIdx.** In hedge mode the wrong index rejects or hits the wrong side.
+- **Signature failures.** Mismatched `recv_window`, clock skew, or signing the wrong body/query string → `10004`/auth errors. Use the same serialized body you send, and sync time.
+- **Float precision.** JS floats drift; format `qty`/`price` as tick/step-aligned strings before signing.
+- **Leverage/mode with open positions.** Switching mode needs no open positions/orders on the symbol; `set-leverage` "not modified" (`110043`) is benign.
+- **Rate-limit / IP ban.** Repeated `10006` or an HTTP 403 → pause and resume at half speed; 403 can be a 10-minute ban.
 
 ## Code patterns
-Idempotent place-with-retry (pybit-style, provider-agnostic logic):
+Signed Bybit V5 POST in TypeScript (Bun `fetch` + `node:crypto`):
 
-```python
-import time, random, uuid
-from pybit.exceptions import InvalidRequestError
+```ts
+import { createHmac } from "node:crypto";
 
-TRANSIENT = {"10006", "10016"}  # rate limit / server error
+const BASE = "https://api.bybit.com";
+const RECV = "5000";
 
-def place_idempotent(session, order, link_id=None, max_retries=3):
-    link_id = link_id or f"bot-{uuid.uuid4().hex[:24]}"  # <=36 chars, persist FIRST
-    for attempt in range(max_retries + 1):
-        try:
-            return session.place_order(orderLinkId=link_id, **order)
-        except InvalidRequestError as e:
-            code = str(getattr(e, "status_code", "") or e.args and e.args[0])
-            # already exists? treat as success — the first attempt landed
-            existing = session.get_open_orders(
-                category=order["category"], symbol=order["symbol"], orderLinkId=link_id
-            )
-            if existing["result"]["list"]:
-                return existing
-            if code not in TRANSIENT or attempt == max_retries:
-                raise                                   # deterministic -> stop
-            time.sleep(min(2 ** attempt, 8) + random.uniform(0, 0.5))  # backoff+jitter
+async function signedPost(path: string, apiKey: string, apiSecret: string, body: Record<string, unknown>) {
+  const ts = Date.now().toString();
+  const payload = JSON.stringify(body);                         // sign the EXACT body you send
+  const sign = createHmac("sha256", apiSecret).update(ts + apiKey + RECV + payload).digest("hex");
+  const res = await fetch(BASE + path, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-BAPI-API-KEY": apiKey,
+      "X-BAPI-TIMESTAMP": ts,
+      "X-BAPI-RECV-WINDOW": RECV,
+      "X-BAPI-SIGN": sign,
+    },
+    body: payload,
+    signal: AbortSignal.timeout(10_000),                        // polling => always time-box
+  });
+  return res.json() as Promise<{ retCode: number; retMsg: string; result: any }>;
+}
 ```
 
-Attach reduce-only TP/SL and place a post-only maker entry (CCXT `bybit`):
+Idempotent MARKET entry with retry (same orderLinkId, status-check before resend):
 
-```python
-oid = f"entry-{uuid.uuid4().hex[:24]}"
-exchange.create_order("BTC/USDT:USDT", "limit", "buy", 0.01, 60000, params={
-    "timeInForce": "PostOnly",   # maker-only, cancels if it would cross
-    "positionIdx": 0,            # one-way mode
-    "clientOrderId": oid,        # -> orderLinkId, idempotency key
-    "takeProfit": 63000, "stopLoss": 58500,
-})
-# exit is always reduce-only so it can never flip the position:
-exchange.create_order("BTC/USDT:USDT", "market", "sell", 0.01, None,
-                      params={"reduceOnly": True, "positionIdx": 0})
+```ts
+const TRANSIENT = new Set([10006, 10016]);                      // rate limit / server error
+
+async function placeMarketIdempotent(
+  key: { apiKey: string; apiSecret: string },
+  order: { symbol: string; side: "Buy" | "Sell"; qty: string; reduceOnly?: boolean; positionIdx?: 0 | 1 | 2 },
+  orderLinkId: string,                                          // persisted to v3_decision_log BEFORE this call
+  maxRetries = 3,
+) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const r = await signedPost("/v5/order/create", key.apiKey, key.apiSecret, {
+        category: "linear", orderType: "Market", timeInForce: "IOC",
+        positionIdx: 0, ...order, orderLinkId,
+      });
+      if (r.retCode === 0) return r.result;                     // success
+      if (!TRANSIENT.has(r.retCode) || attempt >= maxRetries) throw new Error(`${r.retCode} ${r.retMsg}`);
+    } catch (e) {
+      // timeout OR transient: did the first attempt actually land? check by orderLinkId
+      const q = await signedPost("/v5/order/realtime" as any, key.apiKey, key.apiSecret,
+        { category: "linear", symbol: order.symbol, orderLinkId });
+      if (q.result?.list?.length) return q.result.list[0];      // it exists — do NOT resend
+      if (attempt >= maxRetries) throw e;
+    }
+    await Bun.sleep(Math.min(2 ** attempt * 250, 4000) + Math.random() * 250); // backoff + jitter
+  }
+}
+
+// Software-triggered exit is ALWAYS a reduce-only MARKET close:
+async function closePosition(key: { apiKey: string; apiSecret: string }, symbol: string, size: string, linkId: string) {
+  return placeMarketIdempotent(key, { symbol, side: "Sell", qty: size, reduceOnly: true, positionIdx: 0 }, linkId);
+}
+```
+
+Reconcile the DB ledger against the exchange (source of truth) after acting:
+
+```ts
+async function reconcile(key: { apiKey: string; apiSecret: string }, symbol: string, db: DrizzleDb) {
+  const r = await signedPost("/v5/position/list" as any, key.apiKey, key.apiSecret, { category: "linear", symbol });
+  const live = r.result.list.find((p: any) => p.symbol === symbol);
+  const size = Number(live?.size ?? 0), avg = Number(live?.avgPrice ?? 0);
+  // exchange wins: overwrite the ledger row and append an audit event
+  await db.transaction(async (tx) => {
+    await tx.update(v3Positions).set({ size, avgPrice: avg }).where(eq(v3Positions.symbol, symbol));
+    await tx.insert(v3PositionEvent).values({ symbol, kind: "reconcile", size, avgPrice: avg, at: new Date() });
+  });
+}
 ```
 
 ## References
-- [Place Order — Bybit V5](https://bybit-exchange.github.io/docs/v5/order/create-order) — all order params: orderType, timeInForce, orderLinkId, reduceOnly, positionIdx, trigger fields.
-- [Amend Order — Bybit V5](https://bybit-exchange.github.io/docs/v5/order/amend-order) — modify price/qty/trigger by orderId or orderLinkId.
-- [Cancel Order — Bybit V5](https://bybit-exchange.github.io/docs/v5/order/cancel-order) — single cancel; also cancel-all.
-- [Set Trading Stop — Bybit V5](https://bybit-exchange.github.io/docs/v5/position/trading-stop) — position TP/SL, tpslMode Full/Partial, trigger-by, limit prices.
-- [Switch Position Mode — Bybit V5](https://bybit-exchange.github.io/docs/v5/position/position-mode) — one-way vs hedge and positionIdx.
-- [Set Leverage — Bybit V5](https://bybit-exchange.github.io/docs/v5/position/leverage) — buyLeverage/sellLeverage per symbol.
-- [Order WebSocket stream — Bybit V5](https://bybit-exchange.github.io/docs/v5/websocket/private/order) — real-time order/fill state incl. cumExecQty and partial fills.
-- [Error Codes — Bybit V5](https://bybit-exchange.github.io/docs/v5/error) — 10006, 10016, and reject codes to classify retry vs stop.
-- [Rate Limit Rules — Bybit V5](https://bybit-exchange.github.io/docs/v5/rate-limit) — per-endpoint limits and X-Bapi-Limit headers.
-- [Instruments Info — Bybit V5](https://bybit-exchange.github.io/docs/v5/market/instrument) — qtyStep, tickSize, minOrderQty for rounding before submit.
-- [pybit position module (GitHub)](https://github.com/bybit-exchange/pybit/blob/master/pybit/_v5_position.py) — set_leverage / switch_position_mode signatures.
-- [CCXT Bybit reference](https://docs.ccxt.com/exchanges/bybit) — create_order params, postOnly/reduceOnly/positionIdx mapping and clientOrderId → orderLinkId.
+- [Bybit V5 — Place Order](https://bybit-exchange.github.io/docs/v5/order/create-order) — MARKET orderType, `reduceOnly`, `positionIdx`, `orderLinkId`, `timeInForce`.
+- [Bybit V5 — Get Open & Closed Orders](https://bybit-exchange.github.io/docs/v5/order/open-order) — query order status by `orderLinkId` before a retry resend.
+- [Bybit V5 — Cancel Order](https://bybit-exchange.github.io/docs/v5/order/cancel-order) — single/all cancel for the safety-net stop path.
+- [Bybit V5 — Set Trading Stop](https://bybit-exchange.github.io/docs/v5/position/trading-stop) — optional broker-side TP/SL safety net; `tpslMode`, trigger-by.
+- [Bybit V5 — Get Position Info](https://bybit-exchange.github.io/docs/v5/position) — `/v5/position/list` fields (`size`, `avgPrice`, `positionIdx`) for reconcile.
+- [Bybit V5 — Switch Position Mode](https://bybit-exchange.github.io/docs/v5/position/position-mode) — one-way vs hedge and `positionIdx`.
+- [Bybit V5 — Set Leverage](https://bybit-exchange.github.io/docs/v5/position/leverage) — `buyLeverage`/`sellLeverage`; "not modified" `110043` is benign.
+- [Bybit V5 — Authentication / Integration Guidance](https://bybit-exchange.github.io/docs/v5/guide) — X-BAPI header signing, timestamp + apiKey + recv_window + body.
+- [Bybit V5 — Error Codes](https://bybit-exchange.github.io/docs/v5/error) — `10006`/`10016` (retry) vs deterministic rejects (stop).
+- [Bybit V5 — Rate Limit Rules](https://bybit-exchange.github.io/docs/v5/rate-limit) — per-endpoint budgets and `X-Bapi-Limit` headers; 403 IP ban behavior.
+- [Bybit V5 — Get Instruments Info](https://bybit-exchange.github.io/docs/v5/market/instrument) — `qtyStep`, `tickSize`, `minOrderQty` for rounding before submit.
+- [Bun — Documentation](https://bun.com/docs) — `fetch`, `node:crypto` HMAC, `Bun.sleep` for backoff in the shell.
+- [Drizzle ORM — MySQL get started](https://orm.drizzle.team/docs/mysql/get-started-mysql) — transactional writes to `v3_decision_log` / `v3_position_event`.
