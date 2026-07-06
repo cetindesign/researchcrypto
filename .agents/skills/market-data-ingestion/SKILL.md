@@ -1,6 +1,6 @@
 ---
 name: market-data-ingestion
-description: How to fetch and normalize Bybit V5 market data via POLLING REST in TypeScript/Bun for this platform — kline/OHLCV (positional arrays, newest-first, 1000-row limit, ms timestamps, start/end backward pagination), tickers, orderbook snapshots, funding-rate history, and open interest — plus the `collector` loop that takes periodic price snapshots, normalizing string numerics, deduping on candle close/open time, detecting and backfilling gaps, and upserting rows into MySQL with Drizzle (`onDuplicateKeyUpdate`). There is NO WebSocket — everything is periodic `fetch`. Invoke when the user mentions kline, OHLCV, candles, backfill, funding rate, open interest, orderbook snapshot, tickers, pagination, candle gaps, ms timestamps, the collector/price snapshot loop, or normalizing/storing Bybit market data via Drizzle.
+description: How to fetch and normalize Bybit V5 market data via POLLING REST in TypeScript/Bun — kline/OHLCV (positional arrays, newest-first, 1000-row limit, ms timestamps, backward pagination), tickers, orderbook snapshots, funding-rate history, and open interest — plus the `collector` loop that takes periodic price snapshots, normalizes string numerics, dedupes on candle open time, backfills gaps, and upserts into MySQL with Drizzle (`onDuplicateKeyUpdate`). Also covers the derived liquidity inputs coin-universe-selection needs: per-side orderbook DEPTH at ±1%/±2% in USD notional, spread%, OI in USD, listing age from launchTime, and the volume/mcap ratio. There is NO WebSocket — everything is periodic fetch. Invoke when the user mentions kline, OHLCV, candles, backfill, funding rate, open interest, orderbook snapshot, orderbook depth, ±1%/±2% depth, spread, listing age, volume/mcap, tickers, pagination, ms timestamps, the collector loop, universe-selection inputs, or storing Bybit data via Drizzle.
 ---
 
 # Market Data Ingestion (Bybit V5, TypeScript / Bun, polling)
@@ -12,6 +12,7 @@ description: How to fetch and normalize Bybit V5 market data via POLLING REST in
 - Working on the `collector` loop that takes periodic price snapshots.
 - Converting Bybit millisecond timestamps and detecting/backfilling missing candles.
 - Normalizing raw string payloads and upserting them into MySQL through Drizzle.
+- Collecting the **liquidity inputs for coin-universe-selection**: per-side depth at ±1%/±2%, spread%, USD open interest, listing age, and the volume/mcap ratio.
 
 ## Core concepts
 Bybit market-data endpoints are **public** (no signing) under `/v5/market/*`. Every endpoint takes `category` (`linear`/`spot`; this platform is linear-first) and returns the standard `{ retCode, retMsg, result, time }` envelope. **All timestamps are Unix milliseconds** (13 digits) — never seconds. Numeric fields come back as **strings** — cast explicitly.
@@ -50,7 +51,35 @@ Params `category` (linear/inverse), `symbol`, `startTime`, `endTime`, `limit` (�
 Params `category`, `symbol`, `intervalTime` (`5min`,`15min`,`30min`,`1h`,`4h`,`1d`), `startTime`, `endTime`, `limit` (≤200), plus a `cursor`. Returns `openInterest` + `timestamp` (ms).
 
 ### Orderbook snapshot — `GET /v5/market/orderbook`
-Params `category`, `symbol`, `limit` (depth). Returns `b` (bids) and `a` (asks) as `[price, size]` string pairs plus `u`/`seq`. This is a **one-shot** snapshot — since there is no WebSocket, re-poll it when you need a fresh book; do not try to maintain a delta-applied local book.
+Params `category`, `symbol`, `limit` (depth; linear supports up to 500, default 25). Returns `b` (bids, descending) and `a` (asks, ascending) as `[price, size]` string pairs plus `u`/`seq`. This is a **one-shot** snapshot — since there is no WebSocket, re-poll it when you need a fresh book; do not try to maintain a delta-applied local book. Request a large `limit` (e.g. 200) when you need depth for universe scoring, so the book reaches ±2% of mid.
+
+**Derived depth & spread (universe inputs).** The coin-universe-selection skill gates on *per-side USD depth within ±1%/±2% of mid* and on *spread%* — neither is a raw Bybit field; both are computed from this snapshot:
+- **spread%** = `(ask1 − bid1) / mid × 100`, where `mid = (bid1 + ask1) / 2`.
+- **depth±pct per side** = sum of `price × size` for levels whose price is within `pct` of mid — bids and asks accumulated **separately** (a book can be deep one side, thin the other). Sizes are **base-coin units**, so multiply by price to get USD notional.
+```ts
+type Level = [string, string];            // [price, size] strings
+type Book = { b: Level[]; a: Level[] };
+
+function spreadPct(book: Book): number {
+  const bid = +book.b[0][0], ask = +book.a[0][0], mid = (bid + ask) / 2;
+  return mid > 0 ? ((ask - bid) / mid) * 100 : Infinity;
+}
+function depthUsd(book: Book, pct: number): { bid: number; ask: number } {
+  const mid = (+book.b[0][0] + +book.a[0][0]) / 2;
+  const lo = mid * (1 - pct / 100), hi = mid * (1 + pct / 100);
+  let bid = 0, ask = 0;
+  for (const [p, s] of book.b) { const px = +p; if (px < lo) break; bid += px * +s; }
+  for (const [p, s] of book.a) { const px = +p; if (px > hi) break; ask += px * +s; }
+  return { bid, ask }; // USD notional per side
+}
+```
+Store the derived `spreadPct`, `depthBid1pct/2pct`, `depthAsk1pct/2pct` alongside the raw snapshot so the universe scorer reads them without re-walking the book.
+
+### Universe-selection inputs (listing age, USD OI, volume/mcap)
+Three more inputs the universe scorer needs are derived from other endpoints (see the `coin-universe-selection` skill):
+- **Listing age** — from `GET /v5/market/instruments-info` (`category=linear`), read `launchTime` (ms string). `ageDays = (Date.now() − Number(launchTime)) / 86_400_000`. Paginate past 500 symbols with `cursor`. Use `launchTime`, **not** the first kline timestamp (which can predate the perp listing).
+- **Open interest in USD** — `openInterest` (from tickers or `/v5/market/open-interest`) is in **base-coin units**; convert with `oiUsd = openInterest × markPrice` before comparing to a dollar floor. For the 24h OI change, diff the OI history at `intervalTime=4h`.
+- **Volume/mcap wash-trade ratio** — `turnover24h / mcap`, where `mcap = lastPrice × circulatingSupply`. Bybit does **not** provide circulating supply, so supply comes from an external source; keep the ratio **optional** and degrade gracefully when supply is missing. Healthy band ≈ 5–15%; an extreme ratio with a thin book flags wash trading.
 
 ## Implementation checklist
 - [ ] Pick `category` (`linear`) and interval; confirm the symbol exists via `instruments-info`.
@@ -61,6 +90,9 @@ Params `category`, `symbol`, `limit` (depth). Returns `b` (bids) and `a` (asks) 
 - [ ] Upsert on `(symbol, interval, startTime)` via Drizzle `onDuplicateKeyUpdate` so re-runs are idempotent.
 - [ ] Detect gaps: expected next `startTime = prev + intervalMs`; backfill any hole.
 - [ ] Store funding with its per-symbol interval; store OI with its `intervalTime`.
+- [ ] For universe inputs: request a deep orderbook (`limit=200`), compute **spread%** and **per-side ±1%/±2% depth in USD**, and store them.
+- [ ] Convert `openInterest` to **USD** (`× markPrice`) and read `launchTime` for **listing age** before gating.
+- [ ] Compute the **volume/mcap** ratio when circulating supply is available; skip gracefully when it isn't.
 - [ ] Throttle backfill loops (timeout + rate-limit budget) to avoid a 403 IP ban.
 
 ## Do / Don't
@@ -153,8 +185,10 @@ await db.insert(klines).values(
 - [Bybit V5 Get Tickers](https://bybit-exchange.github.io/docs/v5/market/tickers) — snapshot with lastPrice, fundingRate, openInterest, markPrice (collector).
 - [Bybit V5 Get Funding Rate History](https://bybit-exchange.github.io/docs/v5/market/history-fund-rate) — fundingRate/timestamp, per-symbol interval note.
 - [Bybit V5 Get Open Interest](https://bybit-exchange.github.io/docs/v5/market/open-interest) — intervalTime options, cursor pagination.
-- [Bybit V5 Get Orderbook](https://bybit-exchange.github.io/docs/v5/market/orderbook) — REST snapshot, b/a pairs, u/seq fields.
-- [Bybit V5 Get Instruments Info](https://bybit-exchange.github.io/docs/v5/market/instrument) — validate symbols, tick/lot filters.
+- [Bybit V5 Get Orderbook](https://bybit-exchange.github.io/docs/v5/market/orderbook) — REST snapshot, b/a pairs, u/seq; walk levels for ±1%/±2% depth and spread.
+- [Bybit V5 Get Instruments Info](https://bybit-exchange.github.io/docs/v5/market/instrument) — validate symbols, tick/lot filters, `launchTime` for listing age, 500-row cursor pagination.
+- [TradingView — Volume/Market Cap](https://www.tradingview.com/support/solutions/43000703297-volume-market-cap/) — the wash-trade ratio; healthy ≈ 5–15%, extreme values flag manipulation.
+- [Coinbase Institutional — Market impact & order-book liquidity](https://www.coinbase.com/institutional/research-insights/research/trading-insights/market-impact-order-book-liquidity) — why per-side depth (not top-of-book) governs slippage/sizing.
 - [Bybit V5 Rate Limit Rules](https://bybit-exchange.github.io/docs/v5/rate-limit) — throttle backfill polls to avoid IP bans.
 - [Drizzle ORM — Insert & Upsert](https://orm.drizzle.team/docs/insert) — `.onDuplicateKeyUpdate({ set })` for idempotent MySQL upserts.
 - [Drizzle ORM — Upsert guide](https://orm.drizzle.team/docs/guides/upsert) — multi-row upsert with `sql\`values(...)\``.

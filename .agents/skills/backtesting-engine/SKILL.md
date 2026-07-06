@@ -1,6 +1,6 @@
 ---
 name: backtesting-engine
-description: Validating Bybit-perp trading strategies in TypeScript (Bun) by replaying stored candle and v3_decision_log data through the SAME pure-core decision functions the live engine uses. Covers realistic Bybit V5 linear-perp cost modeling (taker/maker fees, slippage, 8h funding), avoiding look-ahead and survivorship bias, next-bar MARKET fills that mirror the polling engine, walk-forward and in-sample/out-of-sample splits, overfitting control, and metrics (Sharpe, Sortino, Calmar, max drawdown, profit factor, win rate) — all in bun:test-friendly pure TS. Note: if the repo has no formal backtester yet, this is guidance to build one AROUND the pure core, not a separate Python engine. Invoke when the user mentions "backtest", "replay decision log", "walk-forward", "out-of-sample", "look-ahead", "survivorship", "fees/slippage/funding modeling", "overfitting", "Sharpe/Sortino/max drawdown/profit factor", or "is this strategy's history trustworthy?".
+description: Validate Bybit-perp strategies in TypeScript (Bun) by replaying stored candles and v3_decision_log through the SAME pure-core decision functions the live engine uses. Covers SkyPower V3 cost modeling (maker 0.02% / taker 0.055% fees, Tier-A 5–10 bps / Tier-B 20–50 bps slippage — never slippage=0, 8h funding), both maker/post-only-limit and taker/MARKET fills (not MARKET-only), avoiding look-ahead and survivorship, next-bar fills, walk-forward and in-sample/out-of-sample splits, overfitting control, and metrics (Sharpe, Sortino, max drawdown, profit factor). For the full go-live gate — hold-out, Deflated Sharpe / PBO, ≥300-trade PF≥1.3 PASS BAR, micro-pilot, kill-criteria — see strategy-validation-protocol. Pure bun:test TS; if none exists, build one AROUND the pure core, not a Python engine. Invoke for "backtest", "replay decision log", "walk-forward", "out-of-sample", "look-ahead", "survivorship", "fees/slippage/funding modeling", "maker vs taker cost", "overfitting", "Sharpe/max drawdown/profit factor".
 ---
 
 # Backtesting Engine
@@ -15,7 +15,8 @@ description: Validating Bybit-perp trading strategies in TypeScript (Bun) by rep
 
 ## Core concepts
 - **Reuse the pure core.** The live v3 engine's decisions come from pure functions (`decide()`, `guardEntry()` — see `strategy-development`). The backtester's only job is to feed those functions historical bars **one closed candle at a time** and simulate the MARKET fills the engine would have sent. If backtest and live share the core, a passing backtest actually means something.
-- **The platform is MARKET-order + decision-log based.** There are no resting limit orders to model queue position for. Entries and exits are taker MARKET orders; TP/SL/trailing are evaluated in software and closed with a MARKET order. So the fill model is: cross the spread + slippage, pay the taker fee.
+- **SkyPower V3 is no longer MARKET-only — model both fill types.** The legacy engine sent only taker MARKET orders; V3 adds **post-only limit entry** (Kayıkçı chases 2–3 ticks then aborts) and **exchange-side TP/SL** on create-order / `/v5/position/trading-stop`. So the backtester needs two fill paths: (1) *taker MARKET* (Avcı breakouts, forced exits) — cross the spread + slippage, pay the **taker 0.055%** fee; (2) *maker post-only* (Kayıkçı entries) — fill only if price trades through the limit, pay the **maker 0.02%** fee, and model a **maker-fill rate** (some post-onlys never fill and abort). Charging taker on a maker entry silently kills Kayıkçı's whole cost thesis.
+- **Slippage is Tier-dependent and never zero.** Size the buffer by liquidity tier: **Tier-A 5–10 bps, Tier-B 20–50 bps** (worse for thin ince-coins). A backtest with `slippage = 0` overstates every edge — on $100 notional the fee+slippage can be double-digit percent of a $1 cut threshold.
 - **Replay two ways.** (1) *Signal replay*: run `decide()` over historical candles and simulate fills — tests the strategy end-to-end. (2) *Decision replay*: read the actual `v3_decision_log` rows and re-price them under the cost model — tests "what did our real decisions cost/earn" and validates the engine matches the core.
 - **Look-ahead bias.** #1 source of fake profit. Decide on candle *i* (closed), fill at candle *i+1*'s open — never same-bar close. The core already drops the forming bar; the backtester must not hand it future bars either.
 - **Survivorship bias.** Crypto alts get delisted / go to zero. If the coin-selector scans many symbols, backtest a point-in-time universe that includes delisted symbols, or you overstate returns.
@@ -33,7 +34,9 @@ description: Validating Bybit-perp trading strategies in TypeScript (Bun) by rep
 ## Implementation checklist
 - [ ] Load clean klines: UTC ms timestamps, oldest-first, no gaps, no duplicate `start`, monotonic.
 - [ ] Feed the pure `decide()` closed candles only; fill the resulting MARKET order at the **next** bar's open.
-- [ ] Apply taker fee + slippage on every entry/exit; apply 8h funding to positions open across a stamp.
+- [ ] Apply the right fee per fill (maker 0.02% for post-only entries, taker 0.055% for MARKET) + a Tier-A 5–10 bps / Tier-B 20–50 bps slippage buffer on every entry/exit; apply 8h funding to positions open across a stamp.
+- [ ] Model post-only maker-fill rate: an entry that never trades through its limit aborts, it does not fill at market.
+- [ ] For the go-live decision, hand results to **strategy-validation-protocol** (hold-out, Deflated Sharpe with trial count, PBO, the ≥300-trade / cost-adjusted PF≥1.3 PASS BAR) — this skill measures; that skill gates.
 - [ ] Round sizes to `qtyStep`/`minOrderQty` exactly as the OMS will; reject sub-minimum trades.
 - [ ] Use a point-in-time universe (include delisted symbols) if the coin-selector scans many coins.
 - [ ] Split IS/OOS and run walk-forward — never optimize and report on the same data.
@@ -44,7 +47,7 @@ description: Validating Bybit-perp trading strategies in TypeScript (Bun) by rep
 ## Do / Don't
 **Do**
 - Drive the backtest through the exact pure-core functions the live engine calls.
-- Fill at next-bar open with taker fee + slippage to mirror the ~10s polling MARKET engine.
+- Fill at next-bar open with the correct fee (maker for post-only, taker for MARKET) + a Tier-A/B slippage buffer.
 - Pull real fee tiers and funding history and apply them per trade and per 8h stamp.
 - Judge robustness by OOS / walk-forward and parameter-surface flatness, not a single Sharpe.
 - Keep enough trades (100+) for metrics to be meaningful.
@@ -59,24 +62,32 @@ description: Validating Bybit-perp trading strategies in TypeScript (Bun) by rep
 ## Common pitfalls
 - **Same-bar look-ahead.** Deciding from bar *i*'s close and filling at bar *i*'s close/open. Delay the fill by one bar.
 - **Funding omission.** Holding a perp for days without applying 8h funding hides a real cost (or gain).
-- **Fee under-modeling.** The platform's MARKET orders are *always* taker — never assume the maker rate.
+- **Fee mis-attribution.** Charge taker 0.055% on MARKET fills and maker 0.02% on post-only entries — using taker everywhere buries Kayıkçı's maker edge; using maker everywhere flatters Avcı's breakout taker cost.
 - **Data quality.** Forward-filled missing candles create phantom flat periods; duplicate `start` timestamps double-count. Validate before running.
 - **Metric misuse.** Crypto trades 24/7/365 — annualize Sharpe with 365 (not 252). Sortino needs a target/MAR; Calmar = CAGR / |maxDD|.
 - **p-hacking.** Sweeping thousands of parameter sets and reporting the best inflates Sharpe by luck. Discount with walk-forward/OOS.
 - **Backtester-vs-engine drift.** If decision replay of `v3_decision_log` doesn't match a fresh signal replay, the engine has inlined logic that diverges from the pure core — fix the engine.
 
 ## Code patterns
-Bybit MARKET-fill cost model + 8h funding (pure TypeScript):
+Bybit V3 cost model — maker/taker fee + Tier-aware slippage + 8h funding (pure TypeScript):
 
 ```ts
-const TAKER = 0.00055;  // confirm via /v5/account/fee-rate; platform orders are always taker
+const FEE = { maker: 0.0002, taker: 0.00055 };   // confirm via /v5/account/fee-rate
+const SLIP_BPS = { A: [5, 10] as const, B: [20, 50] as const }; // Tier-A / Tier-B — NEVER 0
 
-/** MARKET fill: cross the spread, add slippage, pay taker fee. */
-export function marketFill(side: "buy" | "sell", mid: number, qty: number, spread: number, slipBps = 1) {
-  const slip = spread / 2 + mid * (slipBps / 10_000);
+/** Taker MARKET fill (Avcı breakout, forced exit): cross the spread, add tier slippage, pay taker. */
+export function marketFill(side: "buy" | "sell", mid: number, qty: number, spread: number, tier: "A" | "B") {
+  const slip = spread / 2 + mid * (SLIP_BPS[tier][1] / 10_000); // worst end of the band when unsure
   const price = side === "buy" ? mid + slip : mid - slip;
-  const fee = price * qty * TAKER;
-  return { price, fee };
+  return { price, fee: price * qty * FEE.taker, filled: true };
+}
+
+/** Post-only maker fill (Kayıkçı entry): fills ONLY if the bar trades through the limit; else it aborts. */
+export function makerFill(side: "buy" | "sell", limit: number, qty: number, barLow: number, barHigh: number) {
+  const filled = side === "buy" ? barLow <= limit : barHigh >= limit;
+  return filled
+    ? { price: limit, fee: limit * qty * FEE.maker, filled: true }   // maker rate, no slippage past the limit
+    : { price: NaN, fee: 0, filled: false };                          // never filled → chase/abort, don't market in
 }
 
 /** Funding is charged every 8h; a long pays when the rate is positive. */
@@ -98,12 +109,13 @@ export function backtest(candles: Candle[], cfg: StrategyConfig, guardAt: (t: nu
     const window = candles.slice(0, i + 1);            // closed bars up to i
     const d = decide(window, cfg, guardAt(candles[i].start), pos);
     const nextOpen = candles[i + 1].open;              // fill on the NEXT bar's open
+    const tier = d.tier ?? "A";                        // role/universe partition: Kayıkçı = A, Avcı = A|B
     if (d.action === "enterLong") {
       const qty = (cash * (d.sizeWeight ?? 1)) / nextOpen;
-      const { price, fee } = marketFill("buy", nextOpen, qty, /*spread*/ nextOpen * 0.0002);
+      const { price, fee } = marketFill("buy", nextOpen, qty, /*spread*/ nextOpen * 0.0002, tier);
       pos = { size: qty, avgPrice: price, layers: 1 }; cash -= fee;
     } else if (d.action === "close" && pos) {
-      const { price, fee } = marketFill("sell", nextOpen, pos.size, nextOpen * 0.0002);
+      const { price, fee } = marketFill("sell", nextOpen, pos.size, nextOpen * 0.0002, tier);
       cash += pos.size * (price - pos.avgPrice) - fee; pos = null;
     }
     equity.push(cash + (pos ? pos.size * (nextOpen - pos.avgPrice) : 0));
@@ -158,7 +170,10 @@ test("a future bar never changes a past decision", () => {
 - [Drizzle ORM — MySQL get started](https://orm.drizzle.team/docs/mysql/get-started-mysql) — reading stored klines / `v3_decision_log` for replay.
 - [Bybit V5 — Get Kline](https://bybit-exchange.github.io/docs/v5/market/kline) — historical candles, 1000-row limit, newest-first ordering, pagination.
 - [Bybit V5 — Get Funding Rate History](https://bybit-exchange.github.io/docs/v5/market/history-fund-rate) — 8h funding stamps to charge held positions.
-- [Bybit V5 — Get Fee Rate](https://bybit-exchange.github.io/docs/v5/account/fee-rate) — live maker/taker fees to feed the MARKET cost model.
+- [Bybit V5 — Get Fee Rate](https://bybit-exchange.github.io/docs/v5/account/fee-rate) — live maker/taker fees to feed the cost model.
+- [Bybit Trading Fee Structure — Help Center](https://www.bybit.com/en/help-center/article/Trading-Fee-Structure) — USDⓈ-M perp base rates: maker 0.02% / taker 0.055%.
+- [Bybit V5 — Set Trading Stop](https://bybit-exchange.github.io/docs/v5/position/trading-stop) — exchange-side TP/SL the V3 engine now uses (no longer MARKET-only).
+- [Deflated Sharpe ratio — Wikipedia](https://en.wikipedia.org/wiki/Deflated_Sharpe_ratio) — deflating a swept Sharpe by the trial count; the go-live gate lives in strategy-validation-protocol.
 - [Bybit V5 — Get Instruments Info](https://bybit-exchange.github.io/docs/v5/market/instrument) — `qtyStep`/`tickSize`/`minOrderQty` for realistic rounding.
 - [Bybit V5 — Get Position Info](https://bybit-exchange.github.io/docs/v5/position) — fields to reconcile decision-replay results against real positions.
 - [Bybit V5 — Introduction](https://bybit-exchange.github.io/docs/v5/intro) — linear perps, categories, one-way mode assumptions for the simulator.

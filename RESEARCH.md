@@ -37,7 +37,7 @@ Antigravity, **Agent Skills açık standardını** kullanır (Claude Code ile ay
 - Agent Skills in Antigravity — https://antigravity.google/docs/skills
 - Authoring Antigravity Skills (Codelab) — https://codelabs.developers.google.com/getting-started-with-antigravity-skills
 
-## 3. Katalog (24 skill / 8 grup)
+## 3. Katalog (32 skill / 9 grup)
 
 | Grup | Skill'ler |
 |---|---|
@@ -49,11 +49,34 @@ Antigravity, **Agent Skills açık standardını** kullanır (Claude Code ile ay
 | E · Backend/UI/Anahtar | `backend-api-service`, `realtime-trading-dashboard`, `api-key-secrets-security` |
 | F · Güvenlik/İzleme/Test | `trading-app-security`, `monitoring-observability`, `testing-paper-trading` |
 | G · DevOps & AI | `deployment-devops-ha`, `parameter-optimizer`, `sentiment-news-signals`, `gemini-ai-integration` |
+| **H · SkyPower V3 (strateji)** | `coin-universe-selection`, `regime-detection`, `maker-execution-cost-control`, `atr-adaptive-exits`, `entry-guards-cooldown`, `fleet-coordination`, `strategy-validation-protocol`, `market-neutral-funding` |
 
 **v1 → v2 değişimleri:** dil Python→TypeScript/Bun · borsa örnekleri **yalnız Bybit** · WebSocket
 kaldırıldı → `rest-polling-and-rate-limits` · TimescaleDB → `mysql-drizzle-data-layer` · `event-bus-messaging`
 → `bot-orchestration`'a eritildi · `ml-trading-signals` → `parameter-optimizer` · `llm-agent-integration`
 → `gemini-ai-integration` · **yeni:** `pure-core-dirty-shell`, `monorepo-turborepo`, `reconcile-source-of-truth`.
+
+## 3b. SkyPower V3 — Faz 3 stratejisine hizalama (v3, grup H)
+
+Paylaşılan **SkyPower V3 Faz 3** strateji raporuna göre 8 yeni beceri eklendi + 6 mevcut beceri güncellendi.
+Kararlar: kapsam **1(a)** (8 yeni + 6 güncelleme), güncellemeler **2(a)** (mevcut dosyalar yerinde), optimizer
+**3(a)** (canlı döngü kapalı → offline walk-forward'a çerçevelendi).
+
+**8 yeni beceri:** `coin-universe-selection` (iki-katmanlı evren, Tier-A/B eşikleri, wash-trade filtresi,
+Amihud), `regime-detection` (BTC çıpası + breadth + funding/OI, 2/3 kuralı), `maker-execution-cost-control`
+(#1 çözüm: post-only + tick-kovalama + EV matematiği), `atr-adaptive-exits` (borsa felaket-stop + yazılım stop
++ Chandelier), `entry-guards-cooldown` (cooldown/kara-liste + reentrancy guard), `fleet-coordination` (sembol
+kilidi + filo-toplam exposure + rol dağılımı), `strategy-validation-protocol` (maliyet-farkında backtest →
+walk-forward → hold-out → DSR → ≥300 işlem/PF≥1.3 → mainnet mikro-pilot → kill-kriteri), `market-neutral-funding`
+(Safra: delta-nötr spot+perp carry).
+
+**6 güncelleme:** `order-execution-oms` (MARKET-only kaldırıldı → maker/post-only + borsa-tarafı TP/SL) ·
+`risk-management` (ATR boyutlama `qty=(equity×risk%)/(k×ATR)` + filo exposure) · `market-data-ingestion`
+(orderbook derinlik ±%1/±%2, spread, OI, listeleme yaşı) · `backtesting-engine` (maliyet modeli maker 0.02 /
+taker 0.055 + Tier slippage + funding, DSR) · `strategy-development` (breakout/momentum + breadth + azalan
+piramit ≤0.7) · `parameter-optimizer` (canlı döngü kapalı, offline walk-forward'a çerçevelendi).
+
+**İnşa sırası:** Faz A (Kayıkçı'yı canlıya taşıyan çekirdek) → Faz B (filo & kanıt) → Faz C (Safra, motor değişikliği).
 
 ## 4. Metodoloji
 
@@ -127,11 +150,21 @@ kaldırıldı → `rest-polling-and-rate-limits` · TimescaleDB → `mysql-drizz
 - RSS — rss-parser (npm) — https://www.npmjs.com/package/rss-parser · fast-xml-parser — https://www.npmjs.com/package/fast-xml-parser
 - Parametre optimizasyonu — Advances in Financial ML (López de Prado) — https://www.wiley.com/en-us/Advances+in+Financial+Machine+Learning-p-9781119482086 · Walk-forward (IBKR) · Purged CV (Wikipedia) — https://en.wikipedia.org/wiki/Purged_cross-validation · Hyperparameter optimization — https://en.wikipedia.org/wiki/Hyperparameter_optimization
 
+### H · SkyPower V3 strateji kaynakları (grup H)
+- **Evren & likidite:** Amihud illiquidity (Ødegaard notes; paperswithbacktest) · QuantPedia wash-trading · Coinbase market-impact · Bybit orderbook/instruments/open-interest — https://bybit-exchange.github.io/docs/v5/market/orderbook · https://bybit-exchange.github.io/docs/v5/market/instrument · https://bybit-exchange.github.io/docs/v5/market/open-interest
+- **Rejim & trend:** StockCharts Percent-Above-MA (breadth) · TradingView EMA · StockCharts ATR/ATRP · Man Group — Trend Following: Crisis Alpha — https://www.man.com/insights/trend-following-equity-and-bond-crisis-alpha
+- **Maker/maliyet:** Bybit Fee Structure — https://www.bybit.com/en/help-center/article/Trading-Fee-Structure · Get Fee Rate — https://bybit-exchange.github.io/docs/v5/account/fee-rate · Create Order (PostOnly/TIF/stopLoss/slippageToleranceType) — https://bybit-exchange.github.io/docs/v5/order/create-order · LuxAlgo win-rate/RR
+- **ATR/Chandelier çıkış:** StockCharts Chandelier Exit — https://chartschool.stockcharts.com/table-of-contents/technical-indicators-and-overlays/technical-overlays/chandelier-exit · StratBase ATR trailing · LuxAlgo/AlphaEx/ChartMill ATR stop+sizing · Bybit Set Trading Stop — https://bybit-exchange.github.io/docs/v5/position/trading-stop
+- **Doğrulama:** Deflated Sharpe Ratio (Wikipedia; Bailey & López de Prado SSRN) — https://en.wikipedia.org/wiki/Deflated_sharpe_ratio · PBO (SSRN) · Walk-forward (StratBase/QuantInsti) · Profit factor (QuantifiedStrategies) · CoinAPI execution-quality/slippage
+- **Delta-nötr (Safra):** BIS Working Paper 1087 (Crypto Carry) — https://www.bis.org/publ/work1087.htm · BloFin delta-neutral · Talos multi-leg slippage · Bybit Batch Place Order — https://bybit-exchange.github.io/docs/v5/order/batch-place · Funding History — https://bybit-exchange.github.io/docs/v5/market/history-fund-rate
+- **Filo koordinasyonu:** MySQL 8 Locking Functions (GET_LOCK) — https://dev.mysql.com/doc/refman/8.0/en/locking-functions.html · Locking Reads (FOR UPDATE) — https://dev.mysql.com/doc/refman/8.4/en/innodb-locking-reads.html · Drizzle transactions — https://orm.drizzle.team/docs/transactions
+
 ---
 
 ## 7. Sabahki session için notlar
 
-- Katalog eksiksiz (24/24 skill, TypeScript/Bun) ve `claude/crypto-trading-ai-skills-8juz86` dalına push edildi.
+- Katalog eksiksiz (**32/32 skill**, TypeScript/Bun; 8'i SkyPower V3'e özel) ve `claude/crypto-trading-ai-skills-8juz86` dalına push edildi.
+- **SkyPower V3 için sonraki adım:** Faz A becerilerini gerçek repoda uygula (Kayıkçı önce; çoğu config-only + core [KOD]: sembol kilidi, ATR-stop hesaplayıcı, reentrancy guard, borsa-stop entegrasyonu). Her rol `strategy-validation-protocol` çıtasını geçmeden canlıya çıkmaz.
 - Sonraki adım önerileri:
   1. **Repoyu ekleyip birebir hizalama:** Gerçek dosya/tablo/paket adlarını (`packages/*`, gerçek tablo şeması)
      okuyup skill'lerdeki örnek isimleri koda tam uydurma.

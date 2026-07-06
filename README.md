@@ -2,8 +2,8 @@
 
 > **TR:** **TypeScript/Bun** ile yazılmış, **MySQL** destekli, **polling** tabanlı, **Bybit** üzerinde
 > çalışan çok-döngülü bir **çoklu-bot kripto trading platformu** geliştiren bir yapay zeka aracının
-> (**Google Antigravity**) kullanacağı **Agent Skills** kataloğu. 24 skill / 8 grup.
-> Ayrıntılı Türkçe özet ve tam kaynakça için → [`RESEARCH.md`](RESEARCH.md).
+> (**Google Antigravity**) kullanacağı **Agent Skills** kataloğu. **32 skill / 9 grup** —
+> 8'i **SkyPower V3 Faz 3 filo stratejisine** özel. Türkçe özet + kaynakça → [`RESEARCH.md`](RESEARCH.md).
 
 A catalog of **Agent Skills** (`SKILL.md`) that give an AI coding agent the domain expertise to build
 and maintain **this specific** multi-bot crypto trading platform. Targets **Google Antigravity** (open
@@ -30,6 +30,14 @@ and maintain **this specific** multi-bot crypto trading platform. Targets **Goog
 DB = ledger (reconcile)* · *polling not event-driven* · *idempotency via `orderLinkId`* · *audit via
 `v3_decision_log` / `v3_position_event`*.
 
+**SkyPower V3 — Faz 3 strategy alignment (group H):** the 8 strategy-specific skills encode the fleet design —
+4 roles (🎯 Avcı / 🚣 Kayıkçı / 🔭 Bulucu / ⚓ Safra), a **two-tier coin universe** (Tier-A/B liquidity gates),
+**maker/post-only cost control** (the #1 fix — the engine moves off MARKET-only entries), **ATR/Chandelier
+adaptive exits**, a **regime compass** (BTC anchor + breadth + positioning, 2-of-3 rule), **entry guards +
+cooldown/blacklist + reentrancy guard**, **fleet coordination** (symbol lock, fleet-total exposure), and a
+**validation protocol** (cost-aware backtest → walk-forward → hold-out → DSR → ≥300 trades/PF≥1.3 → mainnet
+micro-pilot → kill-criteria). Real `v3_coin_config` keys are used throughout.
+
 ## How Antigravity uses these skills
 
 - **Project scope (this repo):** [`.agents/skills/<name>/SKILL.md`](.agents/skills/) — auto-discovered.
@@ -37,7 +45,7 @@ DB = ledger (reconcile)* · *polling not event-driven* · *idempotency via `orde
 - Each `SKILL.md` has a trigger-packed `description`; the agent loads a skill when the task matches.
   See [`AGENTS.md`](AGENTS.md) for the role → skill mapping.
 
-## Catalog (24 skills)
+## Catalog (32 skills)
 
 ### ⌂ Architecture (read these first)
 | Skill | What it covers |
@@ -91,19 +99,32 @@ DB = ledger (reconcile)* · *polling not event-driven* · *idempotency via `orde
 | Skill | What it covers |
 |---|---|
 | [`deployment-devops-ha`](.agents/skills/deployment-devops-ha/SKILL.md) | Dokploy push-to-main auto build/deploy, single Bun container, ensure-schema (no migrations), SIGTERM shutdown protecting positions, reconcile-on-boot, NTP for recv_window. |
-| [`parameter-optimizer`](.agents/skills/parameter-optimizer/SKILL.md) | The 2h optimizer loop tuning strategy parameters via pure-core replay; walk-forward, overfitting/look-ahead avoidance, grid/random/Bayesian, guardrails on live params. |
+| [`parameter-optimizer`](.agents/skills/parameter-optimizer/SKILL.md) | **Live 2h loop OFF under SkyPower V3** (`optimizer_enabled: 0`) — tuning moves offline into the validation protocol; walk-forward, overfitting/look-ahead avoidance, no frequency-chasing, promotion only through the go-live gate. |
 | [`sentiment-news-signals`](.agents/skills/sentiment-news-signals/SKILL.md) | News (3m) + calendar (15m) scrapers over RSS, Gemini sentiment scoring, the news/BTC-shock/calendar guards, funding & long-short ratio as positioning. |
 | [`gemini-ai-integration`](.agents/skills/gemini-ai-integration/SKILL.md) | Google Gemini from TS (`@google/genai`), structured JSON via responseSchema + Zod re-validation, iron-rule guardrails (never places orders), prompt-injection defense, audit. |
+
+### H · SkyPower V3 — Faz 3 strategy skills (fleet-specific)
+| Skill | What it covers |
+|---|---|
+| [`coin-universe-selection`](.agents/skills/coin-universe-selection/SKILL.md) | Bulucu's two-tier tradeable universe: exact Tier-A/B gates (volume, spread, ±2% depth/side, listing age, ATR%, OI), volume/mcap wash-trade filter, Amihud monthly refresh, scan-wide-open-few, stored in MySQL for the fleet. |
+| [`regime-detection`](.agents/skills/regime-detection/SKILL.md) | The regime/direction compass on 4h bars: BTC anchor (EMA50/200), breadth (% Tier-A above EMA50), positioning (funding + OI), 2-of-3 rule → long/short/neutral; bias via `max_long_pct`/`max_short_pct`; Shock Shield = brake not regime. |
+| [`maker-execution-cost-control`](.agents/skills/maker-execution-cost-control/SKILL.md) | **The #1 fix:** post-only LIMIT entries + tick-chase-then-abort, maker 0.02% vs taker 0.055% math, the EV/breakeven equation, slippage bps budgets, ±1% depth-fraction sizing. Moves the engine off MARKET-only entries. |
+| [`atr-adaptive-exits`](.agents/skills/atr-adaptive-exits/SKILL.md) | 3-layer exit: exchange-side disaster stop (~3×ATR, fills `stop_loss_order_id`) + software 1.5-2×ATR(14) stop + Chandelier trailing (HH(22)−3×ATR); time-stop, ATR-percentile regime scaling, post-exit cooldown. |
+| [`entry-guards-cooldown`](.agents/skills/entry-guards-cooldown/SKILL.md) | Entry gates as ANDed pure predicates: normal + loss cooldown (60m / 2-loss→24h), fleet blacklist (7d/4-loss), the missing **reentrancy guard** (double-add fix), symbol lock, news/event/BTC-shock/neutral vetoes. Never blocks exits. |
+| [`fleet-coordination`](.agents/skills/fleet-coordination/SKILL.md) | The 4-role fleet: MySQL **symbol lock** (one bot/symbol), **fleet-total + net-directional exposure** (correlated BTC/ETH/L1 as one basket), universe partitioning, role capital split (Kayıkçı 35-40% / Safra 25-30% / Avcı 10-15% / Reserve). |
+| [`strategy-validation-protocol`](.agents/skills/strategy-validation-protocol/SKILL.md) | Per-role proof gate: cost-aware backtest → walk-forward → one-time hold-out → **Deflated Sharpe** (count trials) / PBO → pass bar (≥300 trades, PF≥1.3, +EV, 2 regimes) → mainnet micro-pilot → staged scale + −10% kill. |
+| [`market-neutral-funding`](.agents/skills/market-neutral-funding/SKILL.md) | Safra role (**last priority, engine change**): delta-neutral spot-long + perp-short funding carry, two-leg simultaneous fills + partial-fill unwind, funding-threshold entry/exit, weekly delta rebalancing, realistic 2026 net APY. |
 
 ## Repository layout
 
 ```
-.agents/skills/<skill-name>/SKILL.md   # 24 documentation-only Agent Skills (TypeScript/Bun/Bybit)
+.agents/skills/<skill-name>/SKILL.md   # 32 documentation-only Agent Skills (TypeScript/Bun/Bybit)
 AGENTS.md                              # AI agent roles -> which skills each owns
 README.md                              # this catalog index
 RESEARCH.md                            # Türkçe özet + methodology + full source bibliography
 ```
 
 ---
-*Every `SKILL.md` ends with a verified **References** section (~190 unique sources). See
-[`RESEARCH.md`](RESEARCH.md) for the consolidated bibliography and the Turkish summary.*
+*Every `SKILL.md` ends with a verified **References** section (~240 unique sources). Group H is aligned to the
+**SkyPower V3 — Faz 3** strategy report (`v3_coin_config` keys, Tier-A/B, maker/EV math, ATR/Chandelier,
+regime compass, DSR/kill-criteria). See [`RESEARCH.md`](RESEARCH.md) for the bibliography and Turkish summary.*

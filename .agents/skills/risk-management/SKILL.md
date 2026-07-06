@@ -1,6 +1,6 @@
 ---
 name: risk-management
-description: Trading risk controls for a multi-bot, multi-user Bybit-perpetuals platform, written as pure TypeScript functions in packages/ and unit-tested — position sizing (fixed-fractional risk-per-trade, fractional/half-Kelly), software-enforced take-profit/stop-loss/trailing checked on the 10s engine tick and closed with a MARKET order, max-drawdown and daily-loss limits, per-slot exposure and layering (katman) caps, Bybit maintenance-margin / liquidation awareness, the entry guards (news / calendar / BTC-shock / cooldown), and a global kill switch. Use whenever the task involves how much to risk, sizing an order, "risk per trade", "position size", "Kelly", stop-loss/take-profit/trailing, drawdown or daily-loss limits, slot/layering caps, maintenance margin or liquidation price, the guards, kill switch, or adding a risk check to the v3 Bybit engine before it opens/closes a position.
+description: Trading risk controls for the SkyPower V3 Bybit fleet as pure, unit-tested TypeScript in packages/ — ATR-based dollar-risk-constant position sizing (qty = equity*risk% / (k*ATR)), fixed-fractional and fractional/half-Kelly with a 2% cap, per-role risk budgets (Kayikci 0.3-0.5%, Avci 0.5-1%), software-enforced TP/SL/trailing (MARKET-closed), max-drawdown and daily-loss limits, per-slot exposure and layering (katman) caps, fleet-total gross + directional caps, Bybit maintenance-margin / liquidation awareness, the entry guards (news / calendar / BTC-shock / cooldown), and a global kill switch. Use whenever the task involves how much to risk, sizing an order, ATR position sizing, "risk per trade", "position size", "Kelly", "risk per role", stop-loss/take-profit/trailing, drawdown or daily-loss limits, slot/layering or fleet-exposure caps, maintenance margin or liquidation price, the guards, or the kill switch. See atr-adaptive-exits for stop math and fleet-coordination for fleet exposure.
 ---
 
 # Risk Management (Bybit Perpetuals, TypeScript)
@@ -27,6 +27,16 @@ qty        = riskAmount / stopDist  // base units for a linear USDT perp
 
 This decouples size from conviction and auto-shrinks after losses (equity falls → smaller bets). It is the default; Kelly only *scales* it.
 
+**ATR-based sizing (dollar risk constant).** In SkyPower V3 the stop is a **multiple of ATR**, not a fixed percent, so plug `stopDist = k*ATR` into the fixed-fractional formula:
+
+```
+qty = (equity * risk%) / (k * ATR)          // k = 1.5–2.0 for the software initial stop
+```
+
+The point: as a coin's volatility rises the ATR-based stop widens, so `qty` shrinks and **the dollar loss at the stop stays constant** across the whole Tier-A/B ATR range (1–8%). A fixed `stop_loss_pct` breaks this — it noise-stops volatile coins and silently over-risks quiet ones. The `ATR` here is the same `ATR(14)` that atr-adaptive-exits uses to place the stop; compute it in the pure core and pass it in. Round the result to `qtyStep`; reject sub-`minOrderQty`.
+
+**Risk per role (fleet budgets).** Risk% is set per bot role, not globally: **Kayikci (Boatman) 0.3–0.5%** (many small breadth positions — low per-name risk, diversification comes from count), **Avci (Hunter) 0.5–1%** (few high-conviction momentum shots). Whatever the role, cap the fractional-Kelly output at a hard **2% of equity per trade** and clamp `f*=0` (skip) when edge is negative. Role risk% is one input to `qty = equity*risk% / (k*ATR)`.
+
 **Fractional Kelly.** Growth-optimal fraction for win prob `p`, loss prob `q=1-p`, payoff ratio `b` (avg win / avg loss): `f* = p - q/b`. Full Kelly maximizes long-run growth but produces brutal (50–80%+) drawdowns and is hypersensitive to estimation error in `p`/`b`, which are noisy and non-stationary in crypto. **Always use fractional Kelly** — half-Kelly keeps ~75% of the growth at ~half the drawdown; quarter-Kelly for uncertain edges. Rule: `size = min(fixedFractionalCap, kellyMult * f*)`, clamp `f*` to 0 when negative (no edge → no trade).
 
 **Software TP/SL/trailing (no exchange-native stops here).** Because the platform is **polling, not event-driven**, protective exits are enforced **in software on the 10s engine tick**: each tick reads the position's mark/last price, and if price has crossed the stored `takeProfit`, `stopLoss`, or a ratcheting `trailingStop` level, the engine closes the position with a **reduce-only MARKET order**. Trailing is a high-water mark: on each tick, raise the stop as the position moves favorably, never lower it. The trade-off vs Bybit-native conditional orders: up to one tick (~10s) of latency, so size the buffer accordingly and treat maintenance margin as the true hard floor.
@@ -35,7 +45,9 @@ This decouples size from conviction and auto-shrinks after losses (equity falls 
 
 **Daily-loss limit.** Once realized+unrealized PnL for the UTC day drops below `-D` (e.g. -3% of equity), stop new entries for the rest of the day. Reset at 00:00 UTC. Prevents tilt/cascade days.
 
-**Per-slot exposure & layering (katman) caps.** Capital is allocated in **slots** (see portfolio-management). Cap notional per slot, and cap **layering**: how many add-on entries (katman) a slot may stack and the max aggregate size — so a losing position isn't averaged down without bound. Reject any add that would exceed the slot's notional or layer count.
+**Per-slot exposure & layering (katman) caps.** Capital is allocated in **slots** (see portfolio-management). Cap notional per slot, and cap **layering**: how many add-on entries (katman) a slot may stack and the max aggregate size — so a losing position isn't averaged down without bound. Reject any add that would exceed the slot's notional or layer count. Note SkyPower V3 **eliminates DCA-on-loss** (`loss_layer_enabled: 0`, proven 1/13, −$43.69); only the **decreasing profit pyramid** (multiplier ≤ 0.7, max 2–3 layers, Avci only) is allowed — see strategy-development.
+
+**Fleet-total exposure & directional cap.** Per-slot / per-bot `exposure_enabled` is **not enough** when positions are correlated (BTC/ETH/L1 move together): 12 "small" Kayikci longs can be one big beta bet. Add a **fleet-level** cap on total gross notional AND on net directional exposure (long − short), plus a symbol-lock so two bots don't stack the same coin. This lives at the fleet layer — see fleet-coordination — but the per-entry gate here must consult it before allowing a new position.
 
 **Bybit maintenance-margin / liquidation awareness.** On Bybit's Unified Trading Account, liquidation happens when margin can no longer cover **maintenance margin (MM)**. `MM ≈ positionValue × MMR − maintenanceDeduction + est. close fee`; **MMR is tiered by position value** (risk-limit tiers) and adjusts in real time as mark price moves. Isolated mode liquidates when **mark price** hits the position's `liqPrice`; cross/portfolio mode liquidates when account **MMR reaches 100%**, so one bad position can take out others sharing the wallet. Prefer isolated margin per bot/slot. Always trust Bybit's returned `liqPrice`/`positionMM` from the position endpoint; use formulas only as a sanity check.
 
@@ -83,11 +95,11 @@ async function bybitGet(path: string, query: string, key: string, secret: string
 **Everything auditable.** Each risk decision (entry allowed/blocked, stop hit, kill-switch trip) is written to `v3_decision_log`; each state change to `v3_position_event` (Drizzle insert in the engine, not in the pure core).
 
 ## Implementation checklist
-- [ ] Size via a pure `positionQty()` (fixed-fractional), optionally scaled by fractional Kelly (≤ half), clamped to a per-slot notional cap.
+- [ ] Size via a pure `positionQty()` using `qty = equity*risk% / (k*ATR)` (ATR from the pure core), risk% set per role (Kayikci 0.3–0.5%, Avci 0.5–1%), optionally scaled by fractional Kelly (≤ half) and clamped to a 2%-of-equity and per-slot notional cap.
 - [ ] Require a stop for every entry; reject entries with no invalidation.
 - [ ] Enforce software TP/SL/trailing on every 10s tick; close with reduce-only MARKET; use mark price, not last, for the trigger.
 - [ ] Track equity peak → max-drawdown; track UTC-day PnL → daily-loss; reset at 00:00 UTC.
-- [ ] Enforce per-slot exposure and layering (katman) caps before every add.
+- [ ] Enforce per-slot exposure and layering (katman) caps before every add; consult the fleet-total gross + directional cap and symbol-lock (fleet-coordination) too.
 - [ ] AND the four guards (news/calendar/BTC-shock/cooldown) into the entry predicate.
 - [ ] Poll `accountMMRate`; warn at a threshold (e.g. 0.5) well before 1.0; prefer isolated margin per slot.
 - [ ] Round qty/price to the symbol filters; reject sub-`minOrderQty`.
@@ -121,24 +133,41 @@ async function bybitGet(path: string, query: string, key: string, secret: string
 
 ## Code patterns
 
-Pure sizing with fractional-Kelly scaling and a notional cap (`packages/risk`):
+Pure ATR-based sizing — `qty = equity*risk% / (k*ATR)` — with per-role risk, fractional-Kelly scaling, a 2% cap and a notional cap (`packages/risk`):
+```ts
+export type Role = "kayikci" | "avci";
+export const ROLE_RISK: Record<Role, number> = { kayikci: 0.004, avci: 0.0075 }; // 0.4% / 0.75%
+
+export function positionQtyAtr(p: {
+  equity: number; entry: number; atr: number;      // ATR(14) from the pure core
+  role: Role; kAtr?: number;                        // stop = k*ATR, k in [1.5, 2.0]
+  winProb?: number; payoff?: number; kellyMult?: number;
+  hardCapFrac?: number; maxNotionalFrac?: number;
+}): number {
+  const { equity, entry, atr, role, kAtr = 1.75, winProb, payoff,
+          kellyMult = 0.5, hardCapFrac = 0.02, maxNotionalFrac = 0.2 } = p;
+  const stopDist = kAtr * atr;
+  if (stopDist <= 0) throw new Error("ATR/stop distance must be > 0");
+  let riskFrac = Math.min(ROLE_RISK[role], hardCapFrac);   // never exceed 2% of equity
+  if (winProb != null && payoff) {                          // fractional Kelly can only shrink it
+    const f = Math.max(winProb - (1 - winProb) / payoff, 0) * kellyMult;
+    riskFrac = Math.min(riskFrac, f);
+  }
+  const qty = (equity * riskFrac) / stopDist;               // dollar risk constant as ATR widens
+  return Math.min(qty, (equity * maxNotionalFrac) / entry); // notional cap; round to qtyStep in the shell
+}
+```
+
+The older fixed-stop form (still valid when the stop is set explicitly, e.g. a structure level):
 ```ts
 export function positionQty(p: {
-  equity: number; entry: number; stop: number;
-  riskFrac?: number; winProb?: number; payoff?: number;
-  kellyMult?: number; maxNotionalFrac?: number;
+  equity: number; entry: number; stop: number; riskFrac?: number; maxNotionalFrac?: number;
 }): number {
-  const { equity, entry, stop, riskFrac = 0.005,
-          winProb, payoff, kellyMult = 0.5, maxNotionalFrac = 0.2 } = p;
+  const { equity, entry, stop, riskFrac = 0.005, maxNotionalFrac = 0.2 } = p;
   const stopDist = Math.abs(entry - stop);
   if (stopDist <= 0) throw new Error("stop must differ from entry");
-  let scale = 1;
-  if (winProb != null && payoff) {
-    const f = Math.max(winProb - (1 - winProb) / payoff, 0) * kellyMult; // fractional Kelly
-    scale = riskFrac ? Math.min(1, f / riskFrac) : 0;
-  }
-  const qty = (equity * riskFrac * scale) / stopDist;
-  return Math.min(qty, (equity * maxNotionalFrac) / entry); // notional cap
+  const qty = (equity * riskFrac) / stopDist;
+  return Math.min(qty, (equity * maxNotionalFrac) / entry);
 }
 ```
 
@@ -196,5 +225,7 @@ export function allowEntry(c: RiskCtx): { ok: boolean; reason?: string } {
 - [Node.js `crypto` — createHmac](https://nodejs.org/api/crypto.html) — HMAC-SHA256 signing used by the Bybit REST client under Bun.
 - [Zod — Defining schemas](https://zod.dev/api) — validate risk-config inputs (limits, fractions) at the tRPC boundary before they reach the pure core.
 - [Kelly Criterion & Position Sizing (Coriva)](https://coriva.eu.org/en/kelly-criterion-position-sizing/) — full vs fractional Kelly and drawdown trade-offs.
+- [ATR Based Stop Loss and Sizing — AlphaEx Capital](https://www.alphaexcapital.com/prop-trading/risk-money-management-and-psychology-in-prop-trading/prop-risk-management-framework/atr-based-stop-loss-and-sizing) — `qty = risk$ / (ATR*mult)`, dollar-risk-constant sizing across volatility.
+- [Average True Range: Dynamic Stop Loss Levels — LuxAlgo](https://www.luxalgo.com/blog/average-true-range-dynamic-stop-loss-levels/) — why ATR-scaled stops/size beat a fixed percent; feeds `k*ATR` stop distance.
 </content>
 </invoke>

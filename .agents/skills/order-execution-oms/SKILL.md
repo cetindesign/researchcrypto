@@ -1,20 +1,22 @@
 ---
 name: order-execution-oms
-description: Order execution against Bybit V5 linear perps in TypeScript (Bun) for the v3 engine's dirty shell — placing MARKET entries and reduce-only MARKET closes (the platform enters AND exits with MARKET; TP/SL/trailing are evaluated in software then closed with a MARKET order), signed REST via fetch + HMAC-SHA256 (X-BAPI headers, recv_window), orderLinkId idempotency, retry/backoff without duplicate orders, one-way vs hedge (positionIdx), set-leverage, qtyStep/tickSize rounding, and writing every action to v3_decision_log / v3_position_event with the exchange as the source of truth (reconcile). Polling only — there is NO WebSocket order stream; fill/position state comes from signed REST. Invoke when the user mentions "place/close order", "MARKET order", "reduce-only", "orderLinkId", "idempotency", "retry/backoff", "duplicate order", "reconcile", "positionIdx", "hedge mode", "set leverage", "trading stop", "v3_position_event", "HMAC sign Bybit", "recv_window", or "OMS".
+description: Order execution against Bybit V5 linear perps in TypeScript (Bun) for the v3 engine's dirty shell — placing maker post-only LIMIT entries (tick-chase-then-abort loop, see maker-execution-cost-control) plus reduce-only MARKET closes, attaching exchange-side disaster stops via stopLoss on create-order and POST /v5/position/trading-stop (filling stop_loss_order_id), signed REST via fetch + HMAC-SHA256 (X-BAPI, recv_window), orderLinkId idempotency, retry/backoff without duplicate orders, one-way vs hedge (positionIdx), set-leverage, qtyStep/tickSize rounding, and audit to v3_decision_log / v3_position_event with the exchange as source of truth (reconcile). Software TP/SL/trailing drives the normal exit; the exchange stop is a crash/tick-delay safety net. Polling only — NO WebSocket order stream. Invoke for place/close order, post-only entry, MARKET close, reduce-only, orderLinkId, reconcile, positionIdx, set leverage, trading stop, stopLoss, stop_loss_order_id, exchange-side stop, HMAC sign Bybit, or OMS.
 ---
 
 # Order Execution & OMS
 
 ## When to use this skill
-- Placing a MARKET entry or a reduce-only MARKET close against Bybit V5 from the v3 engine shell.
+- Placing a **maker post-only LIMIT entry** (via the tick-chase loop in `maker-execution-cost-control`) or a reduce-only MARKET close against Bybit V5 from the v3 engine shell.
+- Attaching an **exchange-side disaster stop** to a new position (`stopLoss` on create-order or `POST /v5/position/trading-stop`) and recording its `stop_loss_order_id`.
 - Signing Bybit V5 REST requests in TypeScript (`fetch` + `crypto` HMAC-SHA256, X-BAPI headers).
 - Making order submission idempotent so a polling retry or timeout never doubles a position.
-- Closing a position when the in-software TP/SL/trailing check trips (no exchange-side TP order needed).
+- Closing a position when the in-software TP/SL/trailing check trips (normal exit is a reduce-only MARKET close).
 - Configuring one-way vs hedge (`positionIdx`) and leverage once at startup.
 - Reconciling the DB ledger against real exchange positions and writing `v3_position_event` audit rows.
 
 ## Core concepts
-- **MARKET-only execution.** The platform enters and exits with **MARKET** orders (taker). It does NOT rest limit orders or push TP/SL to the exchange as the primary mechanism: TP/SL/trailing are evaluated **in software** each ~10s loop, and when triggered the engine sends a reduce-only MARKET close. Optionally a broker-side stop can be attached via Set Trading Stop as a safety net, but the decision path is software.
+- **Maker post-only entries; MARKET only for closes.** Under SkyPower V3 the engine no longer enters with MARKET (taker) — entries are **maker post-only LIMIT** orders placed through a **tick-chase-then-abort** loop (owned by `maker-execution-cost-control`), because taker commission + thin-coin slippage is the #1 cost problem. Avcı may still take on a genuine breakout. **Exits** remain a reduce-only **MARKET** close when the software TP/SL/trailing check trips. This skill owns the *mechanics* (signing, idempotency, retry, reconcile, stop attachment); the maker skill owns the *chase/abort/EV* logic.
+- **Three-layer exit, one exchange-side stop.** Normal exit is still **software-driven** (TP/SL/trailing evaluated each ~10s loop → reduce-only MARKET close). In addition, attach an **exchange-side disaster stop** (≈3×ATR) at entry so a crash or tick delay can't leave the position unprotected: set `stopLoss` on the create-order request, or push it with `POST /v5/position/trading-stop`. Persist the returned/derived id into the existing `stop_loss_order_id` column (currently unused). The software stop is primary; the exchange stop is the safety net.
 - **reduceOnly for closes.** Every exit carries `reduceOnly: true` so a stale or duplicated close can only shrink/flatten the position — never flip it into an opposite one.
 - **orderLinkId = idempotency key.** A client-supplied unique id (≤ 36 chars). Persist it to `v3_decision_log`/`v3_position_event` **before** sending. On any retry, reuse the *same* orderLinkId; Bybit rejects the duplicate instead of placing a second order. This is the backbone of safe retries under a polling architecture.
 - **Polling, not streaming.** There is NO WebSocket order/execution stream. Fill state and positions are read with signed REST (`/v5/order/realtime`, `/v5/position/list`). Design around interval polling, timeouts, backoff, and rate-limit budgets — not push events.
@@ -25,8 +27,8 @@ description: Order execution against Bybit V5 linear perps in TypeScript (Bun) f
 ## Codebase specifics
 - **Language/runtime.** TypeScript + Bun. HTTP via `fetch`; signing via `node:crypto` `createHmac` (Bun implements it). No `pybit`, no CCXT (mention only as an optional alternative).
 - **Signing (Bybit V5).** Header auth: build `sign = HMAC_SHA256(secret, timestamp + apiKey + recvWindow + queryString|body)` and send `X-BAPI-API-KEY`, `X-BAPI-TIMESTAMP`, `X-BAPI-RECV-WINDOW`, `X-BAPI-SIGN`. API keys are stored **AES-256-GCM encrypted in MySQL** and decrypted in-process per request; never log the secret.
-- **Endpoints (category `linear`).** Place: `POST /v5/order/create`; close: same endpoint with `reduceOnly: true`; query: `GET /v5/order/realtime`; positions: `GET /v5/position/list`; safety TP/SL: `POST /v5/position/trading-stop`; leverage: `POST /v5/position/set-leverage`; mode: `POST /v5/position/switch-mode`.
-- **Engine loop order (one ~10s turn):** read active user configs (Drizzle) → fetch real positions (signed REST) → reconcile DB → software TP/SL/trailing check, close with MARKET if tripped → layering (katman) adds → if a slot is free and guards/coin-selector pass, MARKET entry. Each step writes `v3_decision_log`; each fill/close writes `v3_position_event`.
+- **Endpoints (category `linear`).** Entry: `POST /v5/order/create` with `orderType: "Limit"`, `timeInForce: "PostOnly"`, tick-aligned `price` (and optionally `stopLoss` to attach the disaster stop at open); close: same endpoint with `orderType: "Market"` + `reduceOnly: true`; cancel a resting maker order between chase steps: `POST /v5/order/cancel`; query: `GET /v5/order/realtime`; positions: `GET /v5/position/list`; exchange-side disaster stop / trailing: `POST /v5/position/trading-stop`; leverage: `POST /v5/position/set-leverage`; mode: `POST /v5/position/switch-mode`.
+- **Engine loop order (one ~10s turn):** read active user configs (Drizzle) → fetch real positions (signed REST) → reconcile DB → software TP/SL/trailing check, close with reduce-only MARKET if tripped → layering (katman) adds → if a slot is free and entry-guards/coin-selector pass, place a **maker post-only LIMIT entry** (chase-then-abort, `maker-execution-cost-control`) and attach the exchange-side `stopLoss`. Each step writes `v3_decision_log`; each fill/close writes `v3_position_event`.
 - **Audit trail.** `v3_decision_log` = why the engine did (or didn't) act, incl. the guard reason; `v3_position_event` = what happened to the position (open/add/close/reconcile), with the orderLinkId and exchange `orderId`.
 - **Rate limits.** Per-endpoint; read `X-Bapi-Limit`, `X-Bapi-Limit-Status`, `X-Bapi-Limit-Reset-Timestamp`. HTTP 403 from Bybit can mean a ~10-minute IP ban — back off hard, don't hammer.
 - **Bybit-only.** No Binance execution paths here.
@@ -35,22 +37,28 @@ description: Order execution against Bybit V5 linear perps in TypeScript (Bun) f
 - [ ] Set position mode and leverage once at startup; treat "not modified" (`110043`) as success.
 - [ ] Generate + persist a unique `orderLinkId` to `v3_decision_log` BEFORE sending the order.
 - [ ] Round `qty` to `qtyStep`/`minOrderQty` and any price to `tickSize`; format as strings; reject sub-minimum.
-- [ ] Send the MARKET order; on timeout / 5xx / `10006` / `10016`, retry with the SAME orderLinkId + backoff + jitter.
+- [ ] Place the entry as a **post-only LIMIT** with a pre-persisted `orderLinkId`; run the tick-chase/abort loop (`maker-execution-cost-control`) — do NOT cross to MARKET on entry.
+- [ ] Attach the exchange-side disaster stop (`stopLoss` on create-order or `POST /v5/position/trading-stop`, ≈3×ATR); persist `stop_loss_order_id`.
+- [ ] On timeout / 5xx / `10006` / `10016`, retry with the SAME orderLinkId + backoff + jitter.
 - [ ] On any retry, first query `/v5/order/realtime` by orderLinkId — if it exists, do NOT resend.
-- [ ] Classify errors: retry transient (network/rate/5xx); never retry deterministic (bad params, insufficient balance, duplicate).
-- [ ] Use `reduceOnly: true` for every close; carry the correct `positionIdx`.
+- [ ] Classify errors: retry transient (network/rate/5xx); never retry deterministic (bad params, insufficient balance, duplicate, post-only "would immediately match").
+- [ ] Use `orderType: "Market"` + `reduceOnly: true` for every close; carry the correct `positionIdx`.
 - [ ] After acting, fetch `/v5/position/list` and reconcile the DB; write `v3_position_event`.
-- [ ] Evaluate TP/SL/trailing in software; close with a reduce-only MARKET order when tripped.
+- [ ] Evaluate TP/SL/trailing in software; close with a reduce-only MARKET order when tripped — the exchange stop is only the safety net.
 
 ## Do / Don't
 **Do**
+- Enter with a **post-only LIMIT** and the tick-chase/abort loop; keep MARKET for closes and forced taker exits only.
+- Attach an **exchange-side disaster stop** at open and persist `stop_loss_order_id` as a crash/tick-delay safety net.
 - Make every order idempotent with a pre-persisted `orderLinkId`; reuse it on retry.
 - Treat the exchange as truth: read positions back and reconcile after each action.
 - Distinguish transient vs permanent errors; only retry the transient ones, with jitter.
-- Use `reduceOnly: true` on all exits and the correct `positionIdx`.
+- Use `orderType: "Market"` + `reduceOnly: true` on all exits and the correct `positionIdx`.
 - Poll fill/position state on an interval with timeouts and a rate-limit budget.
 
 **Don't**
+- Don't enter with a MARKET (taker) order on the normal path — that is the cost bug SkyPower V3 removes; abort a stuck maker instead.
+- Don't skip the exchange-side stop — the software stop dies with the process; the broker stop survives.
 - Don't retry a failed submit with a fresh orderLinkId — that is how you get a double position.
 - Don't assume a request failed because the response timed out; query by orderLinkId first.
 - Don't send a close without `reduceOnly` — a delayed close can open an opposite position.
@@ -97,7 +105,7 @@ async function signedPost(path: string, apiKey: string, apiSecret: string, body:
 }
 ```
 
-Idempotent MARKET entry with retry (same orderLinkId, status-check before resend):
+Idempotent MARKET order for **closes and the taker fallback** (same orderLinkId, status-check before resend). Entries use the post-only maker path in `maker-execution-cost-control`, not this helper:
 
 ```ts
 const TRANSIENT = new Set([10006, 10016]);                      // rate limit / server error
@@ -133,6 +141,28 @@ async function closePosition(key: { apiKey: string; apiSecret: string }, symbol:
 }
 ```
 
+Attach the exchange-side disaster stop after the entry fills (≈3×ATR), and persist `stop_loss_order_id`:
+
+```ts
+// Broker-side safety net: survives an engine crash / tick delay. slPrice is tick-aligned, ~3×ATR from entry.
+async function attachDisasterStop(
+  key: { apiKey: string; apiSecret: string }, db: DrizzleDb,
+  symbol: string, slPrice: string, positionIdx: 0 | 1 | 2 = 0,
+) {
+  const r = await signedPost("/v5/position/trading-stop", key.apiKey, key.apiSecret, {
+    category: "linear", symbol, positionIdx,
+    stopLoss: slPrice, slTriggerBy: "MarkPrice", tpslMode: "Full",   // full-position stop
+  });
+  if (r.retCode === 0) {
+    // fill the previously-unused column so reconcile knows a broker stop exists
+    await db.update(v3Positions).set({ stopLossOrderId: r.result?.slOrderId ?? `ts:${symbol}` })
+      .where(eq(v3Positions.symbol, symbol));
+  }
+  return r;
+}
+// Alternatively attach at open: pass `stopLoss: slPrice` directly in the /v5/order/create entry body.
+```
+
 Reconcile the DB ledger against the exchange (source of truth) after acting:
 
 ```ts
@@ -149,10 +179,10 @@ async function reconcile(key: { apiKey: string; apiSecret: string }, symbol: str
 ```
 
 ## References
-- [Bybit V5 — Place Order](https://bybit-exchange.github.io/docs/v5/order/create-order) — MARKET orderType, `reduceOnly`, `positionIdx`, `orderLinkId`, `timeInForce`.
+- [Bybit V5 — Place Order](https://bybit-exchange.github.io/docs/v5/order/create-order) — `orderType` Limit/Market, `timeInForce: PostOnly` (maker entry), `stopLoss` at open, `reduceOnly`, `positionIdx`, `orderLinkId`.
 - [Bybit V5 — Get Open & Closed Orders](https://bybit-exchange.github.io/docs/v5/order/open-order) — query order status by `orderLinkId` before a retry resend.
-- [Bybit V5 — Cancel Order](https://bybit-exchange.github.io/docs/v5/order/cancel-order) — single/all cancel for the safety-net stop path.
-- [Bybit V5 — Set Trading Stop](https://bybit-exchange.github.io/docs/v5/position/trading-stop) — optional broker-side TP/SL safety net; `tpslMode`, trigger-by.
+- [Bybit V5 — Cancel Order](https://bybit-exchange.github.io/docs/v5/order/cancel-order) — cancel a resting post-only maker order between tick-chase steps; single/all cancel.
+- [Bybit V5 — Set Trading Stop](https://bybit-exchange.github.io/docs/v5/position/trading-stop) — exchange-side disaster stop / trailing; `stopLoss`, `slTriggerBy`, `tpslMode`; fills `stop_loss_order_id`.
 - [Bybit V5 — Get Position Info](https://bybit-exchange.github.io/docs/v5/position) — `/v5/position/list` fields (`size`, `avgPrice`, `positionIdx`) for reconcile.
 - [Bybit V5 — Switch Position Mode](https://bybit-exchange.github.io/docs/v5/position/position-mode) — one-way vs hedge and `positionIdx`.
 - [Bybit V5 — Set Leverage](https://bybit-exchange.github.io/docs/v5/position/leverage) — `buyLeverage`/`sellLeverage`; "not modified" `110043` is benign.

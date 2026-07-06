@@ -1,6 +1,6 @@
 ---
 name: strategy-development
-description: Building crypto trading decision logic for the Bybit v3 engine in TypeScript (Bun) as PURE, deterministic, unit-tested functions that live in a shared package (pure core) and are kept out of the engine's exchange/DB side effects (dirty shell). Covers signal generation and hand-rolled indicators in TS (EMA/RSI/ATR/ADX — no pandas, no pandas-ta), entry/exit rules, layering (katman) add thresholds, the coin-selector, and the guards (news / calendar / BTC-shock / cooldown) that gate entries, plus avoiding look-ahead on polled klines. Invoke when the user mentions "strategy", "signal", "indicator", "EMA/RSI/ATR", "entry/exit rule", "layering", "katman", "coin selector", "guard", "news/calendar/BTC-shock/cooldown gate", "pure core", "decision log", "deterministic", "look-ahead", "bun:test", or asks how the bot should decide to long/short a Bybit perp.
+description: Building SkyPower V3 Bybit-fleet decision logic in TypeScript (Bun) as PURE, deterministic, tested functions in a shared package (pure core), kept out of the engine's exchange/DB side effects (dirty shell). Covers hand-rolled indicators in TS (EMA/RSI/ATR/ADX — no pandas); the role strategies — Avci breakout/momentum vs Kayikci cross-sectional trend / breadth; entry/exit rules; the DECREASING profit pyramid (multiplier ≤ 0.7, max 2–3, Avci only) with DCA-on-loss ELIMINATED (loss_layer_enabled 0); the coin-selector and guards (news / calendar / BTC-shock / cooldown); the signal-horizon (15min–4h) vs 3s execution-cadence split; plus avoiding look-ahead on polled klines. Invoke on "strategy", "signal", "indicator", "EMA/RSI/ATR", "breakout", "momentum", "cross-sectional / breadth", "Avci/Kayikci", "entry/exit rule", "layering", "katman", "profit pyramid", "DCA", "coin selector", "guard", "pure core", "look-ahead", "signal horizon vs execution cadence", or how the bot decides to long/short a Bybit perp.
 ---
 
 # Strategy Development
@@ -20,7 +20,12 @@ description: Building crypto trading decision logic for the Bybit v3 engine in T
 - **Indicators in TypeScript.** No pandas-ta / TA-Lib. Hand-roll EMA/RSI/ATR/ADX or use a small TS lib. Rolling indicators (EMA200, ATR14, Wilder RSI) are undefined until enough candles exist — track a `warmup = max lookback` and refuse to emit signals before it.
 - **Look-ahead / repainting.** The engine polls REST every ~10s, so the *latest* kline is usually still forming. Decide only on **confirmed/closed** candles; drop the last in-progress bar. Never reference a future bar, whole-array `Math.max`, or an indicator that recomputes past values.
 - **Guards gate entries.** An otherwise-valid signal is vetoed by: **news** (Gemini sentiment score too negative for the coin), **calendar** (high-impact event window near now), **BTC-shock** (BTC moved > X% in the lookback → risk-off), and **cooldown** (this symbol/user was stopped-out or entered too recently). Guards are pure predicates over injected state.
-- **Layering (katman).** Positions are built in layers: after the first entry, add another layer only when price has moved against the average entry by a configured threshold AND the layer budget/limit allows. This is pure arithmetic over the current position snapshot + config.
+- **Role strategies (SkyPower V3).** The same pure-core toolkit expresses two very different signals:
+  - **Avci (Hunter) — breakout / momentum.** A *per-symbol* signal: price breaks a recent range (Donchian / N-bar high) or momentum/volume expands (`min_momentum_pct`, `hacim_artisi_enabled`). 1–3 positions, **high threshold** (widen scanning, don't lower the bar), tight ATR stop, fast trailing. Taker OK on a breakout. Only Avci may pyramid.
+  - **Kayikci (Boatman) — cross-sectional trend / breadth.** A *fleet-relative* signal: rank the Tier-A universe by trend strength and open the **top-K (10–15)** small positions **in the regime direction** (from the compass — see regime-detection). Diversification comes from **breadth (count), not layering** — Kayikci does **NO** layering. Cut losers with the ATR stop, run winners with the Chandelier trail (atr-adaptive-exits). Post-only limit entry.
+- **Decreasing profit pyramid (Avci only).** Add to a **winner**, never a loser, and with **shrinking** size: each add is `multiplier ≤ 0.7` of the prior layer, **max 2–3 layers**, and only after price has advanced `profit_add_step_pct` in your favor. This scales into strength (positive-skew / pyramiding) without the martingale blow-up of averaging down. **DCA-on-loss is ELIMINATED** (`loss_layer_enabled: 0` — proven 1/13 win, −$43.69); never add to a losing position. **Unit caveat:** whether `profit_add_step_pct` / `layer_trigger_type` is price-% or margin-% is UNVERIFIED in the config — confirm from the engine code before trusting a pyramid threshold.
+- **Signal horizon vs execution cadence.** The engine polls fast (~3s/10s) but that is **execution cadence, not signal cadence**. Signals and the regime compass are computed on **longer bars (15min–4h)**; the fast loop only *acts* on levels already decided from closed bars. Recomputing a signal or a trailing stop off the still-forming 3s snapshot is the classic repaint bug. Keep the signal function keyed to closed higher-timeframe bars.
+- **Layering (katman) — legacy note.** Historically positions were built in layers on drawdown. Under SkyPower V3 that path is **off** (`loss_layer_enabled: 0`); the only surviving "layer" is the decreasing profit pyramid above. When you see katman/add-layer arithmetic, gate it on *profit* progress and the `≤0.7 / max 2–3 / Avci-only` rule, not on drawdown.
 
 ## Codebase specifics
 - **Where it lives.** Decision math belongs in a shared `packages/` library (the same "pure core" pattern the Binance side already uses), exported as plain functions. The **v3 Bybit engine** (a `~10s` loop in `apps/`) imports and calls them. Known deviation: the Bybit engine currently inlines some of this logic — steer new work back into the pure package so it can be tested.
@@ -36,7 +41,9 @@ description: Building crypto trading decision logic for the Bybit v3 engine in T
 - [ ] Compute indicators purely; set `warmup = max(lookbacks)` and return `hold` until enough bars.
 - [ ] Express entry/exit as pure predicates over closed-bar indicator values only.
 - [ ] Implement guards as pure functions `(candidate, state) -> {allowed, reason}`; run them before any entry.
-- [ ] Implement layering add logic as pure arithmetic over the position snapshot + config thresholds.
+- [ ] For Avci, implement the decreasing profit pyramid (`multiplier ≤ 0.7`, `max 2–3`, add on *profit* progress only); refuse any loss-add (`loss_layer_enabled: 0`).
+- [ ] For Kayikci, rank the Tier-A universe and open top-K in the regime direction with NO layering; drive breakout/momentum for Avci from closed-bar levels.
+- [ ] Compute signals on 15min–4h closed bars; let the 3s/10s loop only execute, never re-derive the signal off the forming bar.
 - [ ] Return risk hints (stop distance via ATR, size weight) for the OMS; never place orders in the core.
 - [ ] Cover every branch with `bun:test`, including a determinism test and a shift/repaint test.
 - [ ] Keep `reason` codes stable so `v3_decision_log` stays queryable.
@@ -114,7 +121,9 @@ export type Decision =
 
 export interface StrategyConfig {
   emaFast: number; emaSlow: number; rsiLen: number; rsiFloor: number; atrLen: number;
-  layerDrawdownPct: number; maxLayers: number;
+  role: "avci" | "kayikci";
+  profitLayerEnabled: boolean; profitAddStepPct: number; profitLayerMultiplier: number; profitMaxLayers: number;
+  lossLayerEnabled: boolean;   // SkyPower V3: always false — DCA-on-loss eliminated
 }
 export interface GuardState {
   now: number; newsScore: number; newsAsOf: number;
@@ -146,11 +155,14 @@ export function decide(
   const atr = /* wilder ATR of high/low/close */ 0;    // see rsiWilder pattern
   const last = close.at(-1)!;
 
-  if (pos && pos.size > 0) {                            // manage / layer an existing long
-    const drawdown = (pos.avgPrice - last) / pos.avgPrice;
+  if (pos && pos.size > 0) {                            // manage an existing long
+    const profitPct = (last - pos.avgPrice) / pos.avgPrice * 100;
     if (f < s) return { action: "close", reason: "signal:ema_flip" };
-    if (drawdown >= cfg.layerDrawdownPct && pos.layers < cfg.maxLayers)
-      return { action: "addLayer", reason: "katman:drawdown", layer: pos.layers + 1 };
+    // Decreasing profit pyramid — Avci only, add to a WINNER, never a loser (loss_layer_enabled:0).
+    if (cfg.role === "avci" && cfg.profitLayerEnabled && !cfg.lossLayerEnabled
+        && profitPct >= cfg.profitAddStepPct * (pos.layers + 1)     // next rung is further in profit
+        && pos.layers < cfg.profitMaxLayers)                        // max 2–3 layers
+      return { action: "addLayer", reason: "pyramid:profit", layer: pos.layers + 1 };
     return { action: "hold", reason: "in_position" };
   }
 
@@ -159,6 +171,16 @@ export function decide(
   const veto = guardEntry(g, { newsFloor: -0.3, btcShockPct: 3, staleMs: 10 * 60_000 });
   if (veto) return { action: "hold", reason: veto };
   return { action: "enterLong", reason: "signal:ema_cross+rsi", stopDist: 2 * atr, sizeWeight: 1 };
+}
+```
+
+Pure decreasing-pyramid layer size (base qty geometrically shrinks; `multiplier ≤ 0.7`):
+```ts
+// layer 0 = base entry; each subsequent add is `multiplier`^layer of the base. Avci only.
+export function pyramidLayerQty(baseQty: number, layer: number, multiplier = 0.7, maxLayers = 3): number {
+  if (multiplier > 0.7) throw new Error("profit pyramid multiplier must be <= 0.7 (decreasing)");
+  if (layer < 1 || layer > maxLayers) return 0;                 // no loss-DCA, capped at 2–3 rungs
+  return baseQty * multiplier ** layer;
 }
 ```
 
@@ -191,3 +213,6 @@ test("historical decisions are stable as more candles arrive (no repaint)", () =
 - [Bybit V5 — Get Instruments Info](https://bybit-exchange.github.io/docs/v5/market/instrument) — tick/qty precision the OMS applies to the core's size/stop hints.
 - [Bybit V5 — Introduction](https://bybit-exchange.github.io/docs/v5/intro) — categories, one-way vs hedge (`positionIdx`) context for entries.
 - [Google Gemini API — Docs](https://ai.google.dev/gemini-api/docs) — the news-sentiment source feeding the news guard's score.
+- [What's Trending: A Different Point of Skew — Man Group](https://www.man.com/insights/trend-following-different-point-skew) — why adding to winners (pyramiding) and cutting losers, not averaging down, produces positive skew.
+- [Creating Portfolio Convexity: Trend Versus Options — Man Group](https://www.man.com/insights/creating-portfolio-convexity) — cross-sectional trend / breadth as the Kayikci signal; convex payoff of running winners.
+- [Chandelier Exit — StockCharts ChartSchool](https://chartschool.stockcharts.com/table-of-contents/technical-indicators-and-overlays/technical-overlays/chandelier-exit) — the ATR trailing exit the role strategies hand off to (see atr-adaptive-exits).

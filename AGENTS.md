@@ -27,15 +27,19 @@ Connectivity to Bybit and the polling data pipeline.
 
 ### 2. Quant / Strategy Engineer
 Signal generation, validation, and parameter tuning — all in the pure core.
-- Skills: `strategy-development`, `backtesting-engine`, `parameter-optimizer`, `sentiment-news-signals`
+- Skills: `strategy-development`, `backtesting-engine`, `strategy-validation-protocol`, `parameter-optimizer`, `sentiment-news-signals`, `coin-universe-selection`, `regime-detection`
 
 ### 3. Execution & Risk Engineer
 Order routing, the OMS, capital safety, and reconciliation.
-- Skills: `order-execution-oms`, `risk-management`, `portfolio-management`, `reconcile-source-of-truth`
+- Skills: `order-execution-oms`, `maker-execution-cost-control`, `atr-adaptive-exits`, `entry-guards-cooldown`, `risk-management`, `portfolio-management`, `reconcile-source-of-truth`
 
 ### 4. Platform / Orchestration Engineer
-The single-process, 6-loop runtime and its config.
-- Skills: `bot-orchestration`, `strategy-config-management`, `monorepo-turborepo`, `pure-core-dirty-shell`
+The single-process, 6-loop runtime, its config, and the multi-bot fleet.
+- Skills: `bot-orchestration`, `fleet-coordination`, `strategy-config-management`, `monorepo-turborepo`, `pure-core-dirty-shell`
+
+### 4b. Market-Neutral (Safra) Engineer — last priority
+The delta-neutral funding-carry role (engine change: spot leg + two-leg fills).
+- Skills: `market-neutral-funding`, `fleet-coordination`, `reconcile-source-of-truth`
 
 ### 5. Backend & Frontend Engineer
 The Hono/tRPC control plane, the React panel, and the AI assistant.
@@ -49,6 +53,19 @@ Keys, auth, and application security.
 Deployment, observability, and testing gates.
 - Skills: `deployment-devops-ha`, `monitoring-observability`, `testing-paper-trading`
 
+## SkyPower V3 — Faz 3 build order (fleet strategy)
+When implementing the SkyPower V3 fleet, follow the report's sequence:
+- **Faz A — get Kayıkçı live (mostly config-only + core [KOD]):** `coin-universe-selection`, `regime-detection`,
+  `maker-execution-cost-control`, `atr-adaptive-exits`, `entry-guards-cooldown` (+ updated `order-execution-oms`,
+  `risk-management`, `strategy-development`).
+- **Faz B — fleet & proof:** `fleet-coordination`, `strategy-validation-protocol` (+ updated `backtesting-engine`,
+  `market-data-ingestion`, `parameter-optimizer`).
+- **Faz C — last:** `market-neutral-funding` (Safra — spot leg + two-leg execution = engine change).
+
+**Iron rules for this strategy:** entries are **maker post-only** (not MARKET); every role must pass
+`strategy-validation-protocol` (cost-adjusted PF ≥ 1.3, ≥300 trades, +EV, 2 regimes) before real capital;
+one bot per symbol (`fleet-coordination` lock); DCA-on-loss stays OFF; the live frequency optimizer stays OFF.
+
 ---
-See [`README.md`](README.md) for the full 24-skill catalog and [`RESEARCH.md`](RESEARCH.md) for the
+See [`README.md`](README.md) for the full 32-skill catalog and [`RESEARCH.md`](RESEARCH.md) for the
 research notes and source bibliography (Türkçe özet dahil).
