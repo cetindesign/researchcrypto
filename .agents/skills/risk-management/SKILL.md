@@ -185,7 +185,7 @@ export function allowEntry(c: RiskCtx): { ok: boolean; reason?: string } {
 
 ## References
 - [Bybit V5 — Integration Guidance (auth/signing)](https://bybit-exchange.github.io/docs/v5/guide) — X-BAPI headers, HMAC-SHA256 string-to-sign, recv_window rules.
-- [Bybit V5 — Get Position Info](https://bybit-exchange.github.io/docs/v5/position/position-list) — size, avgPrice, leverage, liqPrice, positionMM, unrealisedPnl.
+- [Bybit V5 — Get Position Info](https://bybit-exchange.github.io/docs/v5/position) — size, avgPrice, leverage, liqPrice, positionMM, unrealisedPnl.
 - [Bybit V5 — Create Order](https://bybit-exchange.github.io/docs/v5/order/create-order) — MARKET/reduceOnly params for software-triggered closes and orderLinkId.
 - [Bybit V5 — Set Trading Stop](https://bybit-exchange.github.io/docs/v5/position/trading-stop) — native TP/SL fields and mark-price triggers (contrast to software-enforced stops).
 - [Bybit V5 — Rate Limit Rules](https://bybit-exchange.github.io/docs/v5/rate-limit) — per-UID/second budget for risk-state polling cadence.

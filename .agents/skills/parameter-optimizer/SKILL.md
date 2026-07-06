@@ -1,140 +1,135 @@
 ---
-name: ml-trading-signals
-description: Build machine-learning trading signals for a Bybit crypto platform without fooling yourself. Covers feature engineering from OHLCV and order-book data, rigorous data-leakage and look-ahead prevention, proper time-series cross-validation (walk-forward, purged K-fold with embargo, combinatorial purged CV), triple-barrier labeling and meta-labeling, sample weighting for overlapping labels, avoiding overfitting, non-stationarity/regime shift, realistic evaluation (transaction costs, slippage, latency), and FreqAI integration. Invoke for "ML signal", "predictive model", "feature engineering", "data leakage", "look-ahead bias", "walk-forward", "purged k-fold", "embargo", "triple barrier", "meta-labeling", "label the data", "overfitting backtest", "TimeSeriesSplit", "FreqAI", "scikit-learn model", "XGBoost/LightGBM signal", or "why does my model work in backtest but not live".
+name: parameter-optimizer
+description: Build and safely operate the `optimizer` loop of this Bybit/Bun trading platform — the background job that runs every 2h to tune strategy PARAMETERS (TP/SL/trailing distances, layering thresholds, coin-selector cutoffs, cooldowns) against recently stored market data by replaying the pure-core decision functions, then writes the chosen params back to per-user config in MySQL via Drizzle. Covers walk-forward / out-of-sample evaluation, avoiding overfitting and look-ahead / data-leakage, objective functions, parameter search (grid / random / Bayesian) in TypeScript, and guardrails so the optimizer can never push reckless params live. Framed as parameter optimization (not ML model training) with notes on where ML could slot in. Invoke for "optimizer loop", "tune parameters", "parameter search", "grid search", "walk-forward", "out-of-sample", "overfitting", "look-ahead", "data leakage", "objective function", "deflated Sharpe", "backtest overfitting", "write params to config", "auto-tune TP/SL", or "how do we optimize strategy settings".
 ---
 
-# Machine Learning for Trading Signals
+# Parameter Optimizer (2h loop)
 
 ## When to use this skill
-- Engineering features from Bybit OHLCV / order-book snapshots for a predictive model.
-- Deciding how to **label** data (up/down/flat, return thresholds, triple-barrier).
-- Setting up cross-validation for time-series so results aren't inflated by leakage.
-- Diagnosing "great backtest, terrible live" — almost always leakage, overfitting, or non-stationarity.
-- Wiring an ML model into FreqAI or a custom Bybit pipeline.
+- Implementing or changing the `optimizer` loop that re-tunes strategy parameters every 2 hours.
+- Choosing an objective function and search method (grid / random / Bayesian) to evaluate candidate params.
+- Replaying stored price data through the **pure-core** decision functions to score a parameter set.
+- Guarding against overfitting, look-ahead bias, and data leakage in the tuning process.
+- Writing accepted parameters back to per-user config (Drizzle) — and blocking reckless ones from going live.
 
 ## Core concepts
 
-**Financial ML is adversarial to your intuition.** The default sklearn workflow (random `train_test_split`, k-fold CV, single accuracy number) is *wrong* for markets and will report a strategy that fails live. The entire discipline is about not fooling yourself.
+**This is parameter optimization, not ML training.** The strategy logic is fixed, deterministic code. The optimizer only searches over a small set of **numeric knobs** — take-profit / stop-loss distances, trailing-stop offset, layering (katman) add thresholds, coin-selector score cutoffs, cooldown length — to find values that would have performed well on **recent stored data**. There is no model to fit; the "model" is the strategy, and we tune its config. (Where ML *could* slot in later: replacing the coin-selector score with a learned ranker, or predicting regime — but that is a separate, heavier discipline with its own leakage rules.)
 
-**Look-ahead bias / data leakage** — using information at time *t* that wasn't actually available until *t+k*. Sources:
-- **Feature leakage:** computing indicators, normalization, or resampling using future bars (e.g. a centered rolling mean, or scaling with stats from the whole dataset).
-- **Label leakage:** the label's outcome window overlaps the features of a later training sample (the classic reason financial CV must be *purged*).
-- **Survivorship/selection:** only modeling coins that still list today.
-- **Fill leakage:** assuming you fill at the same bar's close that generated the signal.
+**Score by replaying the pure core.** Each candidate parameter set is evaluated by running the platform's **pure, TDD'd decision functions** (the same ones the engine should use to decide entries/exits) over a window of stored snapshots — no exchange calls, no DB writes, deterministic. Because the core is pure, the same inputs+params always yield the same simulated trades, which makes the search reproducible. (Known deviation: the Bybit engine partly inlines logic instead of calling the pure core — the optimizer must score against the *same* logic the engine runs, or its "improvement" is fiction.)
 
-**Labeling.** Fixed-horizon returns ("+1 if return over next N bars > 0") ignore *path* and risk. The **triple-barrier method** (López de Prado) labels each event by which of three barriers is touched first: upper (profit-take, +1), lower (stop-loss, −1), or vertical (time expiry, 0/sign of return). Barriers are set from volatility (e.g. dynamic ±kσ), making labels risk-aware and path-dependent.
+**Walk-forward / out-of-sample is mandatory.** Optimizing and scoring on the same data reports a fantasy. Split the stored window into an **in-sample** (tune) segment and a later **out-of-sample** (validate) segment; only accept params that also hold up out-of-sample. Better: rolling walk-forward — tune on window N, test on the immediately-following window, roll forward — because it mirrors how the 2h loop actually redeploys params into the near future.
 
-**Meta-labeling.** A primary model (or rule) decides *side*; a secondary ML model predicts *whether to act* (bet size / take-or-skip). Improves precision and lets you tune the F1 without touching the direction logic.
+**Overfitting is the default failure.** Try enough parameter combinations and one will look great by luck. Bailey & López de Prado showed high in-sample Sharpe is trivially achievable after only a few configurations, and such strategies systematically underperform live. Defenses: keep the search space small and sensible, penalize by the number of trials (deflated Sharpe intuition), require robustness (neighbors of the best params should also be good — a lone spike is noise), and validate out-of-sample.
 
-**Overlapping labels → non-IID samples.** Triple-barrier windows overlap in time, so samples share information. This inflates apparent performance and biases importances. Fix with **sample uniqueness weighting** and **sequential bootstrap**; and CV must **purge + embargo**.
+**Look-ahead / data leakage.** Every decision at simulated time *t* must use only data available at *t*. Common leaks: computing an indicator with the current (still-forming) candle, joining a slower series (news/funding) on event time instead of its availability time, or filling a simulated entry at the same bar's close that generated the signal. Align all features to bar **close** and fill on the *next* bar.
 
-**Purged K-Fold + embargo.** Remove from the training set any observation whose label window overlaps the test fold (purge), plus a small time buffer after the test fold (embargo) to kill serial-correlation leakage. **Combinatorial Purged CV (CPCV)** generates many train/test path combinations for a distribution of out-of-sample performance instead of one fragile number.
+**Objective function encodes what "good" means.** Raw total PnL over-rewards a few lucky trades and ignores risk. Prefer risk-adjusted objectives: Sharpe/Sortino on the trade returns, or PnL penalized by max drawdown, with a **minimum trade count** so a 2-trade fluke can't win. Include realistic costs — Bybit taker fees (the engine uses MARKET orders), slippage, and funding — or the optimizer will chase over-trading.
 
-**Walk-forward** — train on past, test on the immediately following (unseen future) block, roll forward. Mirrors live deployment; `TimeSeriesSplit` gives an expanding-window version.
-
-**Non-stationarity.** Price is non-stationary; returns are closer but volatility/regime shifts constantly. Prefer stationary-but-memory-preserving transforms (fractional differentiation), retrain/recalibrate on a schedule, and evaluate across regimes (bull/bear/chop) not just one lucky period.
-
-## Python & stack specifics
-- **Data:** Bybit `GET /v5/market/kline` for OHLCV; order book via WS `orderbook.{depth}.{symbol}` (e.g. depth 50) for microstructure features. Store with UTC timestamps; align features to bar **close** and shift so a bar's features never include its own future.
-- **Features from OHLCV:** returns, log-returns, realized volatility, RSI/ATR/MACD (via `pandas-ta`/TA-Lib), rolling z-scores, volume imbalance. **Order-book features:** bid-ask spread, order-book imbalance `(bidVol−askVol)/(bidVol+askVol)`, depth at N levels, microprice. All must use only data up to the decision timestamp.
-- **Models:** tree ensembles (LightGBM/XGBoost/`sklearn.ensemble.RandomForest`) dominate tabular financial ML; keep them shallow, regularize, and prefer probability outputs for bet sizing.
-- **CV:** `sklearn.model_selection.TimeSeriesSplit` for a quick walk-forward; implement **purged K-fold with embargo** (from *Advances in Financial ML* / `mlfinlab`) when labels overlap. Never `KFold(shuffle=True)` or random `train_test_split` on time series.
-- **Scaling done right:** fit scalers/encoders on the *training* fold only, then transform test/live (FreqAI does exactly this: it fits on train, applies the same transform to test/prediction data to avoid leakage).
-- **FreqAI:** low-level features go in strategy `feature_engineering_expand_*` / `feature_engineering_standard`; targets in `set_freqai_targets()`; `include_shifted_candles` adds lagged features; `include_timeframes` adds multi-TF. FreqAI retrains on a sliding window (`train_period_days`, `backtest_period_days`) so backtests emulate live retraining without look-ahead.
+## Codebase specifics (Bun / Drizzle / this platform)
+- **Trigger:** the `optimizer` loop fires every ~2h (its own scheduler, started after `ensureSchema`). It reads recent rows from the `collector`'s price-snapshot tables plus the news/calendar signal tables via Drizzle.
+- **Data source:** stored snapshots in MySQL (the collector persists them); Bybit `GET /v5/market/kline` is the upstream shape (strings for OHLCV, epoch-ms UTC). Parse numerics carefully; keep timestamps UTC.
+- **Evaluation harness:** pure functions in `packages/` — import them, feed the candidate params + a slice of stored data, get back simulated trades and a score. No `fetch`, no writes in the scoring path.
+- **Search in TypeScript:** implement grid (nested loops over discrete steps), random (sample the space, cheap for many continuous knobs), or a lightweight Bayesian/Optuna-style loop (maintain best-so-far, propose near promising regions). Keep runs bounded — this shares a process with 5 other loops.
+- **Writing results back (Drizzle):** accepted params are written to the per-user strategy config table (`db.update(config).set({...}).where(eq(config.userId, id))`) inside a transaction, with the previous values recorded for rollback/audit. The live engine reads config each turn, so a write takes effect on the next engine cycle — which is exactly why guardrails matter.
 
 ## Implementation checklist
-- [ ] Fix a strict timeline: every feature at row *t* uses only data with timestamp ≤ *t*'s decision point (shift indicators by 1 bar if computed on the closing bar).
-- [ ] Compute labels with triple-barrier using volatility-scaled barriers; record each label's *end time*.
-- [ ] Derive sample weights from label uniqueness (overlap) and optionally time-decay.
-- [ ] Split with walk-forward or purged K-fold + embargo; never shuffle time.
-- [ ] Fit ALL preprocessing (scalers, imputers, feature selection) inside the training fold only.
-- [ ] Evaluate out-of-sample with costs: Bybit taker/maker fees, slippage, funding, and realistic fills (next bar, not signal bar).
-- [ ] Report a distribution of results (CPCV / multiple walk-forward windows), not a single Sharpe. Track deflated Sharpe / probability of backtest overfitting.
-- [ ] Test across distinct market regimes; check feature importance stability across folds.
-- [ ] Plan retraining cadence and live-vs-backtest drift monitoring before going live.
+- [ ] Define the tunable parameter space explicitly (name, min, max, step, and a hard safe range per knob).
+- [ ] Pull a stored data window; split into in-sample and out-of-sample (or set up rolling walk-forward folds).
+- [ ] Score candidates by replaying the **same** pure-core decision logic the engine uses — no exchange/DB side effects.
+- [ ] Use a risk-adjusted objective (Sharpe/Sortino or PnL/maxDD) with a minimum-trades floor and realistic Bybit costs.
+- [ ] Run a bounded grid/random/Bayesian search; track number of trials for the overfitting discount.
+- [ ] Require the winner to also pass out-of-sample AND be robust (neighbors score similarly), not a lone spike.
+- [ ] Clamp every accepted value to its hard safe range; reject any set that violates risk guardrails.
+- [ ] Write accepted params to config via Drizzle in a transaction; record old values + the run's score for audit/rollback.
+- [ ] Log the run (candidates tried, chosen set, in/out-of-sample scores) so a human can review why params changed.
 
 ## Do / Don't
 **Do**
-- Purge and embargo any train samples whose label window overlaps the test set.
-- Set barriers/thresholds from volatility so labels are comparable across regimes.
-- Weight overlapping samples by uniqueness; use sequential bootstrap for bagging.
-- Fit scalers on train only; simulate the same retraining schedule you'll run live.
-- Include realistic transaction costs, slippage, and fill timing in every evaluation.
+- Validate out-of-sample / walk-forward; only ship params that hold up on unseen data.
+- Keep the search space small and the knobs interpretable; prefer robust plateaus over sharp peaks.
+- Score with the exact decision logic the live engine runs, including MARKET-order fees and slippage.
+- Clamp and gate every parameter before it reaches config; keep a rollback of the previous set.
+- Align every simulated feature to bar close and fill on the next bar.
 
 **Don't**
-- Don't use `train_test_split`/`KFold(shuffle=True)` on time-ordered market data.
-- Don't normalize/standardize/select features using the full dataset (leaks test stats into train).
-- Don't compute indicators with centered or future-looking windows, or fill at the signal bar's close.
-- Don't optimize hyperparameters/thresholds on the same data you report — that's backtest overfitting.
-- Don't trust one high Sharpe number; a single lucky window means nothing.
+- Don't tune and evaluate on the same data — that's guaranteed overfitting.
+- Don't let PnL alone be the objective; a couple of lucky trades will hijack it.
+- Don't optimize against different logic than the engine actually executes.
+- Don't write unbounded params straight to live config — a 0.1% stop or 50x-equivalent sizing is one grid cell away.
+- Don't compute indicators on the forming candle or join news/funding on event time (leakage).
 
 ## Common pitfalls
-- **The "amazing" backtest that dies live:** 95% of the time it's leakage (feature or label) or overfitting from tuning on the test set.
-- **Scaling leakage:** `StandardScaler().fit(X_all)` before splitting — the mean/std carry future information into every fold.
-- **Overlapping-label inflation:** contiguous samples share outcomes, so accuracy and feature importance are overstated; unweighted CV compounds it.
-- **Class imbalance from labeling:** volatile assets produce mostly ±1; a naive accuracy metric hides that the model just predicts the majority.
-- **Regime overfit:** a model tuned on a single bull run learns the trend, not a signal; it inverts in a bear market.
-- **Non-stationary features:** raw price levels as features; the model memorizes a range that never recurs. Use returns / fractional differentiation.
-- **Look-ahead via resampling/merge:** joining a slower timeframe or on-chain series without lagging it to when it was actually published.
+- **In-sample mirage:** the "best" params win only on the tuning window; out-of-sample they're mediocre or negative.
+- **Logic drift:** the optimizer scores the pure core, but the engine inlines slightly different logic → tuned params don't behave as simulated.
+- **Trial explosion:** a fine grid over many knobs finds a lucky combo; without a trials penalty / robustness check it looks like signal.
+- **Cost blindness:** ignoring taker fees/slippage makes high-frequency over-trading params look best; live they bleed.
+- **Silent leakage:** filling at the signal bar's close, or using the current unfinished candle, inflates every score.
+- **Reckless auto-apply:** writing params live with no clamp; the next engine turn acts on a dangerous stop/threshold.
+- **Regime overfit:** the last 2h/day was one regime; params tuned to it invert when the market flips. Validate across regimes.
 
 ## Code patterns
 
-Triple-barrier labeling (volatility-scaled), leak-safe:
-```python
-import numpy as np, pandas as pd
+Score a candidate by replaying the pure core (deterministic, no side effects):
+```ts
+import { simulateStrategy } from "@repo/core";   // pure, TDD'd decision functions
 
-def triple_barrier(close, events, pt=2.0, sl=2.0, vol=None, max_hold=20):
-    # events: index of entry times; vol: daily/bar volatility (EWMA of returns)
-    out = pd.DataFrame(index=events)
-    for t0 in events:
-        end = min(close.index.get_loc(t0) + max_hold, len(close) - 1)
-        path = close.iloc[close.index.get_loc(t0):end + 1]
-        ret = path / close[t0] - 1.0
-        up, dn = pt * vol[t0], -sl * vol[t0]
-        hit_up = ret[ret > up].index.min()
-        hit_dn = ret[ret < dn].index.min()
-        first = min([x for x in [hit_up, hit_dn, path.index[-1]] if pd.notna(x)])
-        out.loc[t0, "t_end"] = first
-        out.loc[t0, "label"] = 1 if first == hit_up else (-1 if first == hit_dn else 0)
-    return out
+type Params = { tpPct: number; slPct: number; trailPct: number; addThreshold: number };
+
+function scoreParams(params: Params, bars: Snapshot[], feeRate = 0.00055): number {
+  const trades = simulateStrategy(bars, params, { feeRate });   // pure: same in → same out
+  if (trades.length < 20) return -Infinity;                     // min-trades floor
+  const rets = trades.map((t) => t.pnlPct);
+  const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
+  const sd = Math.sqrt(rets.reduce((a, r) => a + (r - mean) ** 2, 0) / rets.length) || 1e-9;
+  return (mean / sd) * Math.sqrt(rets.length);                  // risk-adjusted (Sharpe-like)
+}
 ```
 
-Purged K-Fold with embargo (concept):
-```python
-from sklearn.model_selection import BaseCrossValidator
-class PurgedKFold(BaseCrossValidator):
-    def __init__(self, n_splits, t_end, embargo=0.01):
-        self.n_splits, self.t_end, self.embargo = n_splits, t_end, embargo
-    def split(self, X, y=None, groups=None):
-        idx = np.arange(len(X)); folds = np.array_split(idx, self.n_splits)
-        emb = int(len(X) * self.embargo)
-        for te in folds:
-            t0, t1 = X.index[te[0]], X.index[te[-1]]
-            # purge: drop train rows whose label window [row, t_end] overlaps test span
-            train = idx[(self.t_end.values < t0) | (X.index.values > t1)]
-            train = train[:-emb] if emb and len(train) > emb else train  # embargo
-            yield train, te
+Walk-forward search with an out-of-sample gate:
+```ts
+function walkForwardOptimize(bars: Snapshot[], space: Params[]): Params | null {
+  const cut = Math.floor(bars.length * 0.7);
+  const inSample = bars.slice(0, cut), outSample = bars.slice(cut);
+  let best: { p: Params; s: number } | null = null;
+  for (const p of space) {                                      // grid/random candidates
+    const s = scoreParams(p, inSample);
+    if (!best || s > best.s) best = { p, s };
+  }
+  if (!best) return null;
+  const oos = scoreParams(best.p, outSample);                   // must survive unseen data
+  return oos > 0 ? best.p : null;
+}
 ```
 
-Walk-forward with sklearn:
-```python
-from sklearn.model_selection import TimeSeriesSplit
-tscv = TimeSeriesSplit(n_splits=5)      # expanding train, next block = test
-for tr, te in tscv.split(X):
-    scaler.fit(X.iloc[tr]); Xtr = scaler.transform(X.iloc[tr])   # fit on train ONLY
-    model.fit(Xtr, y.iloc[tr]); score(model, scaler.transform(X.iloc[te]), y.iloc[te])
+Clamp + gate, then write to config transactionally (Drizzle):
+```ts
+const SAFE = { slPct: [0.5, 8], tpPct: [0.5, 20], trailPct: [0.2, 10], addThreshold: [0.3, 5] };
+const clamp = (v: number, [lo, hi]: number[]) => Math.min(hi, Math.max(lo, v));
+
+async function applyParams(userId: string, p: Params, score: number) {
+  const safe: Params = {
+    slPct: clamp(p.slPct, SAFE.slPct), tpPct: clamp(p.tpPct, SAFE.tpPct),
+    trailPct: clamp(p.trailPct, SAFE.trailPct), addThreshold: clamp(p.addThreshold, SAFE.addThreshold),
+  };
+  await db.transaction(async (tx) => {
+    const [prev] = await tx.select().from(config).where(eq(config.userId, userId));
+    await tx.insert(optimizerRun).values({ userId, params: safe, prev: prev, score });  // audit/rollback
+    await tx.update(config).set(safe).where(eq(config.userId, userId));                 // engine reads next turn
+  });
+}
 ```
 
 ## References
-- [Advances in Financial Machine Learning — Marcos López de Prado](https://www.wiley.com/en-us/Advances+in+Financial+Machine+Learning-p-9781119482086) — the canonical text: labeling, purged CV, meta-labeling, sample weights, fractional differentiation.
-- [AFML Ch.3 Labeling (triple-barrier) — O'Reilly](https://www.oreilly.com/library/view/advances-in-financial/9781119482086/c03.xhtml) — triple-barrier and meta-labeling definitions.
-- [Purged cross-validation — Wikipedia](https://en.wikipedia.org/wiki/Purged_cross-validation) — purge/embargo and combinatorial purged CV overview.
-- [The 10 Reasons Most ML Funds Fail — López de Prado (GARP)](https://www.garp.org/hubfs/Whitepapers/a1Z1W0000054x6lUAA.pdf) — leakage, overfitting, and non-IID pitfalls to avoid.
-- [mlfinlab documentation (Hudson & Thames)](https://www.mlfinlab.com/) — Python implementations of triple-barrier, purged/combinatorial CV, sample weights.
-- [scikit-learn — TimeSeriesSplit](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.TimeSeriesSplit.html) — walk-forward, expanding-window CV.
-- [scikit-learn — Cross-validation user guide](https://scikit-learn.org/stable/modules/cross_validation.html) — why random CV leaks with time series; pipelines to avoid preprocessing leakage.
-- [FreqAI — Introduction](https://www.freqtrade.io/en/stable/freqai/) — adaptive retraining ML framework inside Freqtrade.
-- [FreqAI — Feature engineering](https://www.freqtrade.io/en/stable/freqai-feature-engineering/) — `feature_engineering_*`, `include_shifted_candles`, train-only scaling to prevent leakage.
-- [FreqAI — Parameter table](https://www.freqtrade.io/en/stable/freqai-parameter-table/) — `train_period_days`, `backtest_period_days`, outlier handling.
-- [Bybit V5 — Get Kline (OHLCV)](https://bybit-exchange.github.io/docs/v5/market/kline) — feature source data.
-- [Bybit V5 — Orderbook (WS)](https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook) — microstructure features (imbalance, depth, microprice).
+- [Advances in Financial Machine Learning — Marcos López de Prado](https://www.wiley.com/en-us/Advances+in+Financial+Machine+Learning-p-9781119482086) — walk-forward, purged CV, overfitting, and why in-sample tuning fails live.
+- [The 10 Reasons Most ML/Quant Backtests Fail — López de Prado (GARP)](https://www.garp.org/hubfs/Whitepapers/a1Z1W0000054x6lUAA.pdf) — selection bias, backtest overfitting, deflated Sharpe intuition.
+- [Walk-Forward Analysis — IBKR Quant](https://www.interactivebrokers.com/campus/ibkr-quant-news/the-future-of-backtesting-a-deep-dive-into-walk-forward-analysis/) — rolling re-optimization / out-of-sample validation for trading strategies.
+- [The Dangers of Backtesting — Portfolio Optimization Book (§8.3)](https://portfoliooptimizationbook.com/book/8.3-dangers-backtesting.html) — data snooping, multiple testing, and robust evaluation.
+- [Purged cross-validation — Wikipedia](https://en.wikipedia.org/wiki/Purged_cross-validation) — purge/embargo to prevent leakage when tuning on overlapping windows.
+- [Hyperparameter optimization — Wikipedia](https://en.wikipedia.org/wiki/Hyperparameter_optimization) — grid vs random vs Bayesian search trade-offs (applies to parameter search).
+- [Grid Search vs Random Search vs Bayesian Optimization — Towards Data Science](https://towardsdatascience.com/grid-search-vs-random-search-vs-bayesian-optimization-2e68f57c3c46/) — when each search method is worth it.
+- [Drizzle ORM — Select](https://orm.drizzle.team/docs/select) — reading stored snapshots/config for the scoring harness.
+- [Drizzle ORM — Insert](https://orm.drizzle.team/docs/insert) — recording optimizer runs for audit/rollback.
+- [Drizzle ORM — MySQL](https://orm.drizzle.team/docs/get-started/mysql-new) — transactions and `update().set().where()` to write params back to config.
+- [Bybit V5 — Get Kline (OHLCV)](https://bybit-exchange.github.io/docs/v5/market/kline) — shape of the stored price data (strings, epoch-ms UTC).
+- [Bybit V5 — Fee Rate](https://bybit-exchange.github.io/docs/v5/account/fee-rate) — taker/maker fees to include in the objective (engine uses MARKET orders → taker).

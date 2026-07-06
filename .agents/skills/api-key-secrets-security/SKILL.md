@@ -1,137 +1,161 @@
 ---
 name: api-key-secrets-security
-description: Protecting Bybit exchange API keys and platform secrets in a multi-tenant crypto trading platform — least-privilege Bybit V5 key permissions (NO Withdraw permission, mandatory IP whitelist, read vs trade/contract scopes), encryption at rest (cryptography Fernet/MultiFernet, cloud KMS, HashiCorp Vault transit), never logging secrets, env vars vs secret managers, key rotation, per-user key isolation, and unified vs sub-account keys. Invoke when the task mentions Bybit API key/secret, key permissions, IP whitelist, "withdraw permission", encrypt API key at rest, Fernet/MultiFernet, KMS, Vault, secret manager, .env secrets, key rotation, sub-account keys, "leaked key", or storing per-user exchange credentials.
+description: Protecting per-user Bybit API keys/secrets in a multi-tenant TypeScript/Bun trading platform — secrets stored AES-256-GCM encrypted in MySQL (Bun/Node `crypto`: random 12-byte IV per record, 16-byte auth tag, 32-byte master key from env/secret), decrypted only in-memory at signing time, Bybit V5 HMAC-SHA256 request signing (X-BAPI headers, recv_window), least-privilege Bybit keys (NO withdraw, IP whitelist), never logging secrets, key rotation (versioned master keys), per-user isolation via Better-Auth session, and never returning secrets to the client. Invoke when the task mentions storing/encrypting a Bybit API key, AES-256-GCM, createCipheriv/getAuthTag, IV/auth tag, master/encryption key, HMAC-SHA256 signing, X-BAPI headers, no-withdraw/IP-whitelist key permissions, key rotation, secret redaction in logs, or per-user key isolation.
 ---
 
-# API Key & Secrets Security (Bybit, multi-tenant)
+# API Key & Secrets Security (Bybit, AES-256-GCM in MySQL)
 
 ## When to use this skill
-- Designing how the platform stores, encrypts, and serves per-user Bybit API keys.
-- Choosing Bybit key permissions/scopes and IP whitelist for bots (safe least-privilege setup).
-- Adding encryption at rest (Fernet/MultiFernet, KMS, or Vault transit) and key rotation.
-- Auditing code/logs to ensure secrets are never printed, logged, or returned in API responses.
-- Deciding env vars vs a secret manager, and unified-account vs sub-account key isolation per user/bot.
+- Designing how the platform stores, encrypts, and serves per-user Bybit API keys (AES-256-GCM at rest in MySQL).
+- Implementing encrypt/decrypt with Bun/Node `crypto` (random IV, auth tag, master key from env) and decrypting only at signing time.
+- Signing Bybit V5 REST requests with HMAC-SHA256 (X-BAPI headers, recv_window) using the just-decrypted secret.
+- Choosing least-privilege Bybit key permissions (Read+Trade, **no Withdraw**) and an IP whitelist.
+- Adding key rotation, log redaction, per-user isolation, and never returning secrets to the client.
 
 ## Core concepts
-- **Least privilege**: a trading bot needs **Read + Trade** (Bybit: `ContractTrade`/`Spot`/`Derivatives` Order+Position, plus read). It must **never** have **Withdraw**. A trade-only key bound to a static IP cannot move funds out even if the key is fully leaked — this is the single most important control.
-- **IP whitelist**: Bybit lets you bind a key to specific IPs. Whitelisted keys **do not expire**; keys **without** an IP whitelist **expire after ~90 days** and cannot be used for withdrawals at all. Always whitelist the VPS/static egress IP in production.
-- **Read vs Trade vs Withdraw**: three permission tiers. Read-only for dashboards/analytics; Trade for execution bots; Withdraw — avoid entirely on programmatic keys. Grant per-product scopes (spot/derivatives/contract) only for what the bot trades.
-- **Unified vs sub-account keys**: for multi-tenant isolation, prefer creating a **sub-account (Sub UID) per user/strategy** and issuing sub-account API keys. Blast radius of a leaked key is one sub-account, not the whole master. Master keys can create/rotate sub keys programmatically.
-- **Encryption at rest**: never store the API secret in plaintext. Encrypt with a symmetric scheme (Fernet = AES-128-CBC + HMAC-SHA256 authenticated) whose data key lives in a KMS/Vault or env — not next to the ciphertext. Better: envelope encryption (KMS/Vault holds the master key; DB holds encrypted secrets).
-- **Secret hygiene**: secrets never appear in logs, tracebacks, error responses, git, or client-visible API models. Treat the exchange secret like a password hash — decrypt only in memory at the moment of the signed request.
+- **Encrypted at rest in MySQL, plaintext never touches disk.** Each user's Bybit `api_secret` (and often the `api_key`) is encrypted with **AES-256-GCM** and stored in the DB alongside a **random per-record IV** and the **auth tag**. GCM is authenticated encryption: the 16-byte tag proves the ciphertext (and any associated data) was not tampered with — decryption fails loudly if a byte changed.
+- **Random IV per record, never reused.** GCM needs a **unique 12-byte (96-bit) IV per encryption under the same key** — reuse is catastrophic for GCM. Generate `crypto.randomBytes(12)` for every write; store it with the ciphertext. The IV is not secret; the key is.
+- **One master key, held outside the DB.** A single 32-byte (256-bit) master key comes from an env var / injected secret (or, optionally, a KMS as the master-key store — see below). It must **not** live in the same table/DB as the ciphertext. Losing separation defeats the encryption.
+- **Decrypt just-in-time, in memory only.** The engine decrypts the secret only at the moment it signs a Bybit request, uses it, and drops the reference. Never log it, never write it to a temp file, never put it in an error/response body.
+- **Least-privilege exchange key.** A bot needs **Read + Trade** (Bybit `ContractTrade: [Order, Position]`, and Spot if used). It must **never** have **Withdraw**. Bind the key to the container's static egress **IP whitelist**. A no-withdraw, IP-bound key cannot move funds out even if fully leaked — the single most important control.
+- **Per-user isolation via Better-Auth.** App auth is Better-Auth (Google + email); every key row is owned by a user id. Every read/decrypt is scoped to the authenticated session's user — user A can never fetch or use user B's key.
 
-## Bybit / Python specifics
-- **Permissions object (V5)**: keys carry permissions like `ContractTrade: ["Order","Position"]`, `Spot: ["SpotTrade"]`, `Wallet: ["AccountTransfer"]`, `Derivatives`, `Options`, `CopyTrading`, `Exchange`, `Earn`, `NFT`. For a bot, enable only the trading product(s) it uses; leave `Wallet`/withdrawal off.
-- **Programmatic key management**: `POST /v5/user/create-sub-api-key` (create sub-account key), `POST /v5/user/update-api-key` / `update-sub-api-key` (modify permissions/IP), `GET /v5/user/query-api` (`apikey-info` — inspect permissions, IP list, expiry), delete endpoints for rotation. Use these to provision and rotate per-user keys without a human touching secrets.
-- **IP whitelist via API**: set `ips` when creating/modifying keys; `"*"` means no restriction (avoid). Note Bybit disallows unrestricted-IP keys from withdrawing regardless.
-- **Signing**: Bybit V5 requests are signed with HMAC-SHA256 over `timestamp + api_key + recv_window + queryString/body`; `recv_window` default 5000ms and server-time sync matters. `pybit`/`ccxt` handle this — you supply key+secret at client init, so decrypt just-in-time and avoid holding plaintext longer than needed.
-- **Storage**: keep the platform's own secrets (JWT key, DB URL, KMS creds) in env via `pydantic-settings`; keep per-user exchange secrets **encrypted in the DB**, with the encryption key in KMS/Vault. Don't put user exchange keys in `.env`.
+## Codebase specifics (Bun / Node crypto / Bybit V5 / Drizzle)
+- **Crypto library:** Bun exposes the Node `crypto` API — `createCipheriv('aes-256-gcm', key, iv)`, `cipher.update`/`final`, `cipher.getAuthTag()`; decrypt with `createDecipheriv` + `decipher.setAuthTag(tag)`. No third-party crypto lib needed; **no Fernet, no Vault as the primary store**.
+- **Storage shape (Drizzle/MySQL):** a `user_exchange_keys` table with `userId`, `apiKeyEnc` (varbinary/blob), `apiSecretEnc`, `iv` (12 bytes), `authTag` (16 bytes), `keyVersion` (which master key encrypted it), `label`, `createdAt`. Schema guaranteed by idempotent `ensure-schema.ts` (`ALTER TABLE`, no migrations). Consider encrypting a combined `key||secret` payload so both share one IV/tag record.
+- **Master key source:** `process.env.MASTER_KEY_B64` (32 bytes, base64) injected by Dokploy into the single container. Keep a **map of versioned keys** so rotation can decrypt old records: `{ v1: buf, v2: buf }`, encrypt with the newest, decrypt with the version stored on the row.
+- **Bybit V5 signing:** build the pre-sign string per Bybit rules — `timestamp + apiKey + recvWindow + (queryString | jsonBody)` — then `crypto.createHmac('sha256', apiSecret).update(preSign).digest('hex')`. Send `X-BAPI-API-KEY`, `X-BAPI-TIMESTAMP` (ms), `X-BAPI-RECV-WINDOW` (e.g. 5000), `X-BAPI-SIGN`. Keep server clock NTP-synced; `server_time - recvWindow <= timestamp < server_time + 1000`.
+- **Polling, signed REST only:** all exchange access is periodic signed `fetch` (no WS). The decrypt→sign→fetch path runs inside the engine's 10s loop; the tRPC API never signs a Bybit call on a page-load and never returns a secret.
+- **Client-facing model:** the API returns only masked metadata (`label`, `apiKeyMasked` like `AB••••WXYZ`, permissions, IP list) — never the secret. A write endpoint accepts the secret (over TLS), encrypts, and stores; a read endpoint never emits it.
 
 ## Implementation checklist
-- [ ] Provision Bybit keys with Read+Trade only, **Withdraw disabled**, IP-whitelisted to the bot's egress IP.
-- [ ] One sub-account (Sub UID) + sub key per user/strategy for tenant isolation.
-- [ ] Store API secrets encrypted at rest (Fernet/MultiFernet or Vault transit); never plaintext.
-- [ ] Keep the data-encryption key out of the DB — in a KMS/Vault or injected env var, rotated separately.
-- [ ] Decrypt secrets only in memory, at request time; never write decrypted secrets to logs/temp files.
-- [ ] Add log scrubbing/redaction and a secret-detection scan (e.g. gitleaks/trufflehog) in CI.
-- [ ] Never expose secrets in API responses — separate `KeyCreate` (write secret) from `KeyRead` (masked, e.g. last 4 chars).
-- [ ] Implement rotation: `MultiFernet` for the encryption key; API endpoints to create a new Bybit key and revoke the old.
-- [ ] Enforce `.gitignore` on `.env`; different secrets per environment; least-privilege on the secret store itself.
-- [ ] Alerting on key usage anomalies; schedule ~90-day Bybit key rotation reminders.
+- [ ] `user_exchange_keys` table: `apiSecretEnc`, `iv` (12B), `authTag` (16B), `keyVersion`, `userId` — via `ensure-schema.ts`.
+- [ ] Master key: 32-byte key from env (base64), validated on boot; versioned map for rotation; **not** stored in the DB.
+- [ ] `encryptSecret`: `randomBytes(12)` IV → `createCipheriv('aes-256-gcm', key, iv)` → store ciphertext + IV + `getAuthTag()` + version.
+- [ ] `decryptSecret`: load version's key → `createDecipheriv` → `setAuthTag(tag)` → `update`/`final`; only in the engine at signing time.
+- [ ] Bybit sign helper: HMAC-SHA256 over `ts+apiKey+recvWindow+payload`; set the four `X-BAPI-*` headers.
+- [ ] Provision Bybit keys Read+Trade only, **Withdraw disabled**, IP-whitelisted to the container egress IP.
+- [ ] Per-user scoping: every decrypt is filtered by `ctx.user.id` (Better-Auth session); never trust an id from input.
+- [ ] Redact secrets in logs (never log the decrypted secret, the master key, or full ciphertext).
+- [ ] Client models: `KeyCreate` (write secret) vs `KeyRead` (masked only); never return the secret.
+- [ ] Rotation path: add a new master-key version, re-encrypt records lazily/in batch, drop old version when done.
+- [ ] Secret-scanning in CI (gitleaks/trufflehog); `.env` gitignored; different master key per environment.
 
 ## Do / Don't
 **Do**
-- Disable Withdraw on every programmatic key and bind an IP whitelist — belt and suspenders.
-- Use envelope encryption: KMS/Vault holds the master key, DB holds ciphertext.
-- Isolate tenants with sub-account keys so one leak ≠ platform-wide compromise.
-- Rotate encryption keys with `MultiFernet` (new key first for encrypt, old kept for decrypt) and re-encrypt lazily/batch.
-- Redact secrets in logs and scan repos/CI for leaked keys.
+- Use AES-256-GCM with a fresh random 12-byte IV per record and store the auth tag; verify the tag on decrypt.
+- Keep the 32-byte master key in env/secret injection (optionally a KMS as master-key store), never beside the ciphertext.
+- Decrypt only in memory, at Bybit-signing time, then drop the plaintext.
+- Ship no-withdraw, IP-whitelisted Bybit keys; grant only the products the bot trades.
+- Scope every key access to the Better-Auth session user; mask secrets in every API response.
 
 **Don't**
-- Don't ever enable Withdraw permission on a bot/API key.
-- Don't store exchange secrets in plaintext, in `.env`, in the frontend, or in git.
-- Don't log, print, or return secrets — not in debug logs, tracebacks, or error payloads.
-- Don't keep the encryption key in the same store/table as the ciphertext.
-- Don't use one master-account key for all users (no isolation, catastrophic blast radius).
-- Don't leave keys without an IP whitelist in production (they expire in ~90 days and are withdrawal-locked, and are less safe).
+- Don't ever enable Withdraw on a programmatic Bybit key.
+- Don't reuse an IV across records, hardcode the master key, or store it in the DB/repo/frontend.
+- Don't store the secret in plaintext, in `.env`, or return it from any endpoint.
+- Don't log/print the decrypted secret, the master key, IVs+key together, or full request bodies with signatures.
+- Don't use one master Bybit key for all users — isolate per user; a leak must not be platform-wide.
+- Don't skip auth-tag verification (`setAuthTag`) — without it you lose tamper detection and integrity.
 
 ## Common pitfalls
-- **Withdraw left on "just in case"**: turns a leaked config/repo into direct fund theft.
-- **No IP whitelist**: key silently expires after ~90 days (bot dies) and is far riskier if leaked.
-- **Secrets in logs/tracebacks**: an unhandled exception or `logger.info(config)` leaks the secret to log aggregation.
-- **Encryption key beside ciphertext**: storing the Fernet key in the same DB/repo as the encrypted secret provides no real protection.
-- **No rotation path**: single hardcoded Fernet key means you can never rotate without downtime — use `MultiFernet` from day one.
-- **Shared/master key across tenants**: a single leak compromises every user's funds.
-- **Returning full secret in API responses / admin UIs**: mask everything but the last few chars.
+- **IV reuse / static IV:** the classic GCM mistake — same key + repeated IV breaks confidentiality. Always `randomBytes(12)` per write.
+- **Auth tag dropped:** forgetting to store or `setAuthTag` on decrypt → GCM can't authenticate; either it throws or (if you use raw CBC instead) you lose integrity entirely.
+- **Master key beside ciphertext:** putting the key in the same MySQL/DB or repo as the encrypted secret provides no real protection.
+- **Withdraw left on "just in case":** turns a leaked key/config into direct fund theft.
+- **No IP whitelist:** unrestricted-IP keys are riskier and Bybit expires them (~90 days) and blocks withdrawals regardless — whitelist the egress IP.
+- **Secrets in logs/errors:** an unhandled throw or `console.log(config)` leaks the secret to log aggregation — redact and use masked models.
+- **Cross-tenant leak:** decrypting by a `keyId` from request input instead of scoping to `ctx.user.id`.
+- **Clock skew on signing:** `X-BAPI-TIMESTAMP` outside `recvWindow` → Bybit rejects; keep the container NTP-synced.
 
 ## Code patterns
-```python
-# Fernet encryption + rotation with MultiFernet
-from cryptography.fernet import Fernet, MultiFernet
+```ts
+// crypto.ts — AES-256-GCM encrypt/decrypt with random IV + auth tag (Bun/Node crypto)
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 
-# keys pulled from KMS/Vault/env — NEVER hardcoded, NEVER stored with the ciphertext.
-# First key is used to encrypt; all keys are tried on decrypt (enables rotation).
-KEYS = [Fernet(k) for k in load_keys_from_secret_manager()]  # [new, old, ...]
-cipher = MultiFernet(KEYS)
+// versioned master keys (32 bytes each) from env/secret injection — NEVER in the DB
+const KEYS: Record<string, Buffer> = {
+  v2: Buffer.from(process.env.MASTER_KEY_V2_B64!, 'base64'), // current (encrypt with this)
+  v1: Buffer.from(process.env.MASTER_KEY_V1_B64!, 'base64'), // kept only to decrypt old rows
+};
+const CURRENT = 'v2';
 
-def encrypt_secret(api_secret: str) -> bytes:
-    return cipher.encrypt(api_secret.encode())        # store this ciphertext in the DB
+export interface EncPayload { ciphertext: Buffer; iv: Buffer; authTag: Buffer; keyVersion: string; }
 
-def decrypt_secret(token: bytes) -> str:
-    return cipher.decrypt(token).decode()             # decrypt just-in-time, in memory only
+export function encryptSecret(plaintext: string): EncPayload {
+  const iv = randomBytes(12);                                  // unique 96-bit IV per record
+  const cipher = createCipheriv('aes-256-gcm', KEYS[CURRENT], iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  return { ciphertext, iv, authTag: cipher.getAuthTag(), keyVersion: CURRENT };
+}
 
-# Rotate: prepend a fresh key, then re-encrypt existing tokens with .rotate()
-def rotate(token: bytes) -> bytes:
-    return cipher.rotate(token)                        # re-encrypts under the newest key
+export function decryptSecret(p: EncPayload): string {         // call only at signing time
+  const key = KEYS[p.keyVersion];
+  if (!key) throw new Error('unknown key version');
+  const decipher = createDecipheriv('aes-256-gcm', key, p.iv);
+  decipher.setAuthTag(p.authTag);                              // verifies integrity — throws if tampered
+  return Buffer.concat([decipher.update(p.ciphertext), decipher.final()]).toString('utf8');
+}
 ```
 
-```python
-# Redacting secrets from logs (structlog processor / logging filter)
-import re
-SECRET_RE = re.compile(r'(api[_-]?secret|api[_-]?key|authorization)"?\s*[:=]\s*"?([^\s",]+)', re.I)
+```ts
+// bybit-sign.ts — HMAC-SHA256 signed Bybit V5 request; secret decrypted just-in-time
+import { createHmac } from 'node:crypto';
 
-def scrub_secrets(_, __, event_dict):
-    for k, v in list(event_dict.items()):
-        if isinstance(v, str):
-            event_dict[k] = SECRET_RE.sub(r'\1=***REDACTED***', v)
-        if k.lower() in {"api_secret", "api_key", "secret", "password", "authorization"}:
-            event_dict[k] = "***REDACTED***"
-    return event_dict
+export async function bybitSignedFetch(
+  method: 'GET' | 'POST', path: string, params: Record<string, unknown>,
+  enc: EncPayload, apiKey: string, recvWindow = 5000,
+) {
+  const secret = decryptSecret(enc);           // in memory only; drops out of scope after this call
+  const ts = Date.now().toString();
+  const payload = method === 'GET'
+    ? new URLSearchParams(params as Record<string, string>).toString()
+    : JSON.stringify(params);
+  const preSign = ts + apiKey + recvWindow + payload;
+  const sign = createHmac('sha256', secret).update(preSign).digest('hex');
+
+  const url = 'https://api.bybit.com' + path + (method === 'GET' && payload ? `?${payload}` : '');
+  return fetch(url, {
+    method,
+    headers: {
+      'X-BAPI-API-KEY': apiKey,
+      'X-BAPI-TIMESTAMP': ts,
+      'X-BAPI-RECV-WINDOW': String(recvWindow),
+      'X-BAPI-SIGN': sign,
+      ...(method === 'POST' ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: method === 'POST' ? payload : undefined,
+  });
+  // never console.log(secret / sign / preSign)
+}
 ```
 
-```python
-# API models: write the secret, never read it back
-from pydantic import BaseModel, SecretStr
+```ts
+// api models — write the secret, never read it back; redact in logs
+export const KeyCreate = z.object({ label: z.string(), apiKey: z.string(), apiSecret: z.string() });
+export interface KeyRead { id: string; label: string; apiKeyMasked: string; } // e.g. "AB••••WXYZ"
 
-class ExchangeKeyCreate(BaseModel):
-    api_key: str
-    api_secret: SecretStr          # SecretStr keeps it out of repr()/logs
-
-class ExchangeKeyRead(BaseModel):  # what the frontend gets
-    id: int
-    label: str
-    api_key_masked: str            # e.g. "AB••••WXYZ" — never the secret
-```
-
-```python
-# Provision a least-privilege Bybit sub-account key (pybit), Withdraw OFF, IP-bound
-from pybit.unified_trading import UserService  # master-account authenticated client
-resp = master.create_sub_api_key(
-    subuid=sub_uid,
-    readOnly=0,                                  # 0 = read+write (trade), still NO withdraw perm
-    ips="203.0.113.10",                          # bind to the bot's static egress IP
-    permissions={"ContractTrade": ["Order", "Position"],
-                 "Spot": ["SpotTrade"]},         # ONLY the products this bot trades; no Wallet/Withdraw
-)
+const SECRET_KEYS = new Set(['apiSecret', 'api_secret', 'secret', 'password', 'authorization', 'x-bapi-sign']);
+export function redact<T extends Record<string, unknown>>(o: T): T {
+  const out: any = Array.isArray(o) ? [] : {};
+  for (const [k, v] of Object.entries(o)) {
+    out[k] = SECRET_KEYS.has(k.toLowerCase()) ? '***REDACTED***'
+      : v && typeof v === 'object' ? redact(v as any) : v;
+  }
+  return out;
+}
 ```
 
 ## References
-- [Bybit V5 — Create Sub UID API Key](https://bybit-exchange.github.io/docs/v5/user/create-subuid-apikey) — programmatic per-user key provisioning with permissions/IP.
-- [Bybit V5 — Modify Master API Key](https://bybit-exchange.github.io/docs/v5/user/modify-master-apikey) — permissions object & IP whitelist fields.
+- [Node.js crypto — Cipher / createCipheriv](https://nodejs.org/api/crypto.html#cryptocreatecipherivalgorithm-key-iv-options) — AES-256-GCM, `getAuthTag`, GCM notes (Bun implements this API).
+- [Bun — Node crypto.createCipheriv reference](https://bun.com/reference/node/crypto/createCipheriv) — confirms Bun support for the Node crypto cipher API.
+- [Node.js crypto — Decipher / setAuthTag](https://nodejs.org/api/crypto.html#deciphersetauthtagbuffer-encoding) — verifying the GCM auth tag on decrypt.
+- [AES-GCM example (Node crypto, gist)](https://gist.github.com/rjz/15baffeab434b8125ca4d783f4116d81) — random IV + auth tag encrypt/decrypt reference.
+- [Bybit V5 — Authentication / signing](https://bybit-exchange.github.io/docs/v5/guide) — HMAC-SHA256 pre-sign string, X-BAPI headers, recv_window.
+- [Bybit V5 — Introduction](https://bybit-exchange.github.io/docs/v5/intro) — request signing rules, server-time/recv_window validation.
+- [Bybit V5 — Create Sub UID API Key](https://bybit-exchange.github.io/docs/v5/user/create-subuid-apikey) — per-user key provisioning, permissions, IP.
 - [Bybit V5 — Get API Key Information](https://bybit-exchange.github.io/docs/v5/user/apikey-info) — inspect permissions, IP list, expiry.
-- [Bybit V5 — Introduction / authentication](https://bybit-exchange.github.io/docs/v5/intro) — HMAC-SHA256 signing, `recv_window`, server time.
-- [Bybit Help Center — How to create your API key](https://www.bybit.com/en/help-center/article/How-to-create-your-API-key) — permissions, IP whitelist, expiry rules.
-- [cryptography — Fernet (symmetric encryption)](https://cryptography.io/en/stable/fernet/) — Fernet & MultiFernet key rotation API.
-- [HashiCorp Vault — Transit secrets engine](https://developer.hashicorp.com/vault/docs/secrets/transit) — encryption-as-a-service / envelope encryption.
-- [OWASP — Secrets Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html) — lifecycle, storage, rotation, no-logging guidance.
-- [Pydantic — settings & SecretStr](https://docs.pydantic.dev/latest/concepts/pydantic_settings/) — env-based config and secret-safe types.
+- [Bybit Help — How to create your API key](https://www.bybit.com/en/help-center/article/How-to-create-your-API-key) — no-withdraw, IP whitelist, expiry rules.
+- [Better Auth — Session management](https://better-auth.com/docs/concepts/session-management) — app auth / per-user isolation via session.
+- [Drizzle ORM — MySQL column types](https://orm.drizzle.team/docs/column-types/mysql) — binary/varbinary columns for ciphertext, IV, auth tag.
+- [OWASP — Secrets Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html) — storage, rotation, no-logging guidance.
+- [OWASP — Cryptographic Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html) — authenticated encryption (GCM), IV/key management.

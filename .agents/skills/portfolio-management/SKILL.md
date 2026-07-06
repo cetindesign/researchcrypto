@@ -153,7 +153,7 @@ export function reconcileSlot(
 
 ## References
 - [Bybit V5 — Get Wallet Balance](https://bybit-exchange.github.io/docs/v5/account/wallet-balance) — totalEquity for equity snapshots (balance + unrealized PnL).
-- [Bybit V5 — Get Position Info](https://bybit-exchange.github.io/docs/v5/position/position-list) — live positions to reconcile the ledger against (exchange = truth).
+- [Bybit V5 — Get Position Info](https://bybit-exchange.github.io/docs/v5/position) — live positions to reconcile the ledger against (exchange = truth).
 - [Bybit V5 — Get Closed PnL](https://bybit-exchange.github.io/docs/v5/position/close-pnl) — per-trade closedPnl, openFee, closeFee for realized PnL.
 - [Bybit V5 — Get Transaction Log](https://bybit-exchange.github.io/docs/v5/account/transaction-log) — authoritative ledger including funding settlements.
 - [Bybit — P&L Calculations (USDT Perpetual & Expiry)](https://www.bybit.com/en/help-center/article/Profit-Loss-calculations-USDT-Contract) — realized vs unrealized PnL formulas.

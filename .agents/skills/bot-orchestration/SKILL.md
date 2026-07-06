@@ -182,10 +182,11 @@ export async function rateLimited<T>(uid: string, call: () => Promise<T>,
 - [Bun — node:timers module](https://bun.com/reference/node/timers) — setTimeout/setInterval/clearTimeout used to self-schedule loops.
 - [Hono — Bun getting started](https://hono.dev/docs/getting-started/bun) — serving the API from the same Bun process that runs the loops.
 - [tRPC — Define Routers](https://trpc.io/docs/server/routers) — the typed appRouter mounted on Hono in the boot entrypoint.
-- [@hono/trpc-server (tRPC v11 adapter)](https://trpc.io/docs/server/adapters/fetch) — mounting tRPC on Hono's fetch handler.
+- [@hono/trpc-server (Hono ↔ tRPC middleware)](https://www.npmjs.com/package/@hono/trpc-server) — mounting the tRPC router on Hono in the boot entrypoint.
+- [tRPC — Fetch / Edge Runtimes Adapter](https://trpc.io/docs/server/adapters/fetch) — the fetch adapter the Hono middleware is built on.
 - [Bybit V5 — Rate Limit Rules](https://bybit-exchange.github.io/docs/v5/rate-limit) — per-UID/second budget, X-Bapi-Limit headers, retCode 10006 shared across loops.
 - [Bybit V5 — Integration Guidance (auth/signing)](https://bybit-exchange.github.io/docs/v5/guide) — signed REST all loops share; recv_window and clock-skew rules.
-- [Bybit V5 — Get Position Info](https://bybit-exchange.github.io/docs/v5/position/position-list) — positions fetched each tick and on boot for reconcile.
+- [Bybit V5 — Get Position Info](https://bybit-exchange.github.io/docs/v5/position) — positions fetched each tick and on boot for reconcile.
 - [Docker — docker container stop (SIGTERM then SIGKILL)](https://docs.docker.com/reference/cli/docker/container/stop/) — the shutdown signal/grace model the SIGTERM handler must satisfy.
 - [Drizzle ORM — Transactions](https://orm.drizzle.team/docs/transactions) — atomic tick writes so a mid-write SIGKILL leaves a repairable ledger.
 - [Redis Streams](https://redis.io/docs/latest/develop/data-types/streams/) — what a real event bus would add (consumer groups, XACK/XPENDING) if the platform ever outgrows one process.

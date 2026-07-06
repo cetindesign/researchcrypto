@@ -1,131 +1,129 @@
 ---
-name: timeseries-data-storage
-description: Design storage for Bybit market and trading data — choosing between TimescaleDB (hypertables, continuous aggregates, native compression, retention policies), InfluxDB, plain PostgreSQL, and Parquet; schema design for OHLCV candles, raw trades/ticks, orders and fills; indexing on (symbol, time); downsampling and higher-timeframe rollups; and avoiding float rounding on prices by using NUMERIC/Decimal. Invoke when the user mentions storing candles/OHLCV, tick data, trade history, order/fill logging, TimescaleDB, hypertable, continuous aggregate, compression, retention policy, InfluxDB, Parquet, time-series schema, (symbol,time) index, downsampling, backfill, or price precision / Decimal vs float in the database.
+name: mysql-drizzle-data-layer
+description: Design and evolve the data layer for this Bun + TypeScript multi-bot Bybit platform — MySQL accessed through Drizzle ORM. Covers Drizzle schema for candles/price snapshots, orders/fills, per-user bot config, and the audit tables v3_decision_log and v3_position_event; indexing on (symbol, time); using DECIMAL columns / strings for price and quantity precision (never float); idempotent upserts; and the DB-as-ledger principle. Crucially there are NO migration files — schema is guaranteed by an idempotent ensure-schema.ts that runs ALTER TABLE ... IF NOT EXISTS style guards on boot. Invoke when the user mentions Drizzle schema, mysqlTable, DECIMAL vs float, price precision, (symbol,time) index, candle/snapshot storage, order/fill tables, decision log, position event, audit ledger, ensure-schema, no migrations, onDuplicateKeyUpdate, or when to use TimescaleDB. This codebase uses plain MySQL, not TimescaleDB/Influx/Postgres.
 ---
 
-# Time-Series Data Storage
+# MySQL + Drizzle Data Layer
 
 ## When to use this skill
-- Choosing a datastore for OHLCV candles, raw trades/ticks, or order/fill history from Bybit.
-- Designing a TimescaleDB hypertable and its chunk interval, indexes, and compression policy.
-- Building continuous aggregates to roll 1m candles up to 5m/1h/1d without recomputation.
-- Setting retention: keep raw ticks 30 days, keep aggregated candles for years.
-- Picking `NUMERIC`/`Decimal` over `float` to avoid price rounding errors.
-- Deciding when Parquet (cold storage / backtest datasets) beats a live database.
+- Defining or extending a Drizzle table (candles, snapshots, orders, fills, config, audit) in the shared DB package.
+- Deciding column types for money — `decimal` vs `float` — and how prices/qtys are stored and read.
+- Adding an index on `(symbol, time)` (or `(symbol, orderLinkId)`) for fast engine reads.
+- Writing or extending `ensure-schema.ts` guards instead of adding a migration file.
+- Recording an audit row in `v3_decision_log` (why the engine did X) or `v3_position_event` (what happened).
+- Answering "should we move to TimescaleDB?" — know the trade-off, but this platform stays on plain MySQL.
 
 ## Core concepts
-- **OHLCV**: open, high, low, close, volume per (symbol, interval, bucket-start-time). The canonical candle row.
-- **Ticks/trades**: individual executions (price, size, side, timestamp) — highest cardinality, largest volume.
-- **Hypertable**: a Postgres table TimescaleDB auto-partitions by time into **chunks** (child tables). You query one logical table; it prunes chunks by time range for fast reads.
-- **Chunk interval**: the time span per chunk. Rule of thumb: size so one chunk (plus its indexes) fits ~25% of RAM. Too small = planning overhead; too large = poor pruning/compression.
-- **Continuous aggregate (CAGG)**: an incrementally, automatically refreshed materialized view — the convenience of a view with the speed of a table. Roll 1m→1h candles cheaply; you can layer CAGGs on top of CAGGs (hierarchical rollups).
-- **Compression**: TimescaleDB converts old row-oriented chunks to columnar storage (typical 10–20x), set by `segmentby`/`orderby`. Compressed chunks are read-mostly.
-- **Retention policy**: a background job that drops chunks older than a threshold — cheap because it drops whole chunks, not row-by-row `DELETE`.
-- **Downsampling**: producing lower-resolution series (ticks→1m→1h) so you retain long history without keeping every tick.
+- **DB as accounting ledger.** The DB is not the source of truth for live positions — the exchange is (see `reconcile-source-of-truth`). The DB records what we *believe* and, in the audit tables, *why we acted*. It must be append-friendly and reconstructable.
+- **Idempotent schema, no migrations.** There are no versioned migration files. On boot, `ensure-schema.ts` runs `CREATE TABLE IF NOT EXISTS` and column/index guards (`ADD COLUMN` wrapped so re-runs are safe). Deploy = push to `main` → Dokploy rebuilds one container → boot re-runs ensure-schema. Schema changes are additive and backward-compatible.
+- **Exact decimals, never float.** Prices, quantities, and PnL use MySQL `DECIMAL` (fixed-point, exact) — `float`/`double` are approximate and break equality/accumulation. In Drizzle, `decimal()` reads back as a **string** by default; keep money as strings end-to-end and only convert at math boundaries.
+- **`(symbol, time)` indexing.** Time-series tables (candles, snapshots, events) are almost always queried "latest rows for this symbol" — a composite index on `(symbol, time)` makes those range scans cheap.
+- **Idempotent writes.** Because the loop retries and polls, inserts must tolerate replays. Use `insert().onDuplicateKeyUpdate()` keyed on a natural unique key (e.g. `(symbol, interval, bucketStart)` for candles, `orderLinkId` for orders) so a re-run updates instead of duplicating.
+- **Audit tables are immutable.** `v3_decision_log` and `v3_position_event` are append-only. Never `UPDATE`/`DELETE` them; they are the forensic trail when a bot misbehaves.
 
-## Storage choice (pick per workload)
-- **TimescaleDB** (default for this platform): full SQL/ACID on Postgres, joins to your relational bot/order tables, hypertables + CAGGs + compression + retention. Outperforms plain Postgres greatly on complex time queries and high cardinality (many symbols). Best when you already use Postgres and need mixed relational + time-series with exact `NUMERIC`.
-- **Plain PostgreSQL**: fine for low volume / MVP; you lose automatic partitioning, CAGGs, and columnar compression — large tables and retention become painful.
-- **InfluxDB**: excellent on-disk compression and purpose-built ingest, but its own query model (Flux/line protocol), weaker for relational joins and exact-decimal money math.
-- **Parquet** (Arrow/pandas/pyarrow): columnar files with the best compression (10–20:1); ideal for **cold storage**, backtest datasets, and sharing — but it is files, not a live queryable transactional store. Partition by `symbol`/`date`.
+## Codebase specifics (Drizzle / MySQL / this platform)
+- **Schema in a shared package**, imported by the engine, the collector, the tRPC API, and `ensure-schema.ts`. Types flow from Drizzle inference — no hand-written row interfaces.
+- **`ensure-schema.ts` runs first** in the boot sequence, before the collector and the v3 Bybit engine start. It guarantees every column the current code references exists.
+- **Candles/snapshots** come from the collector polling Bybit REST (`GET /v5/market/kline`), which returns arrays of **strings** — store them straight into `decimal`/`varchar` without a `parseFloat`.
+- **Orders/fills** mirror Bybit `GET /v5/order/realtime` and `GET /v5/execution/list`; key orders by `orderLinkId` (our idempotency key) so reconcile can match DB rows to exchange orders.
+- **`v3_decision_log`**: one row per engine decision (symbol, action, chosen candidate, guard results, snapshot of inputs) — written every tick.
+- **`v3_position_event`**: one row per state transition (opened, closed, TP/SL hit, partial fill, drift detected during reconcile). This is where discrepancies from reconcile land.
+- **Timestamps**: Bybit sends epoch milliseconds. Store as `bigint` (raw ms) and/or `timestamp`; be consistent and keep everything UTC.
 
-## Bybit / Python specifics
-- Bybit V5 kline via `GET /v5/market/kline` returns `[startTime, open, high, low, close, volume, turnover]` as **strings** — parse prices with `Decimal`, not `float`. WebSocket `publicTrade` and `kline` topics stream live data to ingest.
-- Bybit timestamps are **epoch milliseconds** (UTC). Store as `TIMESTAMPTZ` in UTC; convert ms→timestamp on ingest and keep the raw ms if you need exact reconstruction.
-- Kline `confirm` flag on the WS `kline` topic marks a closed candle — only persist confirmed candles to OHLCV, or upsert the forming candle and finalize on `confirm=true`.
-- Ingest path in Python: `pybit`/`ccxt` → validate → `psycopg`/`asyncpg` `COPY` or batched inserts. Use `ON CONFLICT (symbol, interval, bucket) DO UPDATE` for idempotent candle upserts (handles reconnect replays).
-- Use `numeric(38, 12)` (or per-asset scale) for price/qty; Python `Decimal` maps cleanly, and psycopg returns `Decimal`.
+## When TimescaleDB would help (and why we don't use it here)
+- TimescaleDB (a Postgres extension) auto-partitions a table into time **chunks** (hypertables), adds continuous aggregates and columnar compression — genuinely better for very high-cardinality tick ingest and heavy analytical rollups.
+- This platform stays on **plain MySQL**: volume is modest (periodic snapshots every few seconds, not per-trade tick firehose), the team already runs MySQL + Drizzle, and a single container with idempotent ensure-schema is the deploy model. Reach for Timescale only if snapshot volume grows into the "millions of rows/day, need automatic retention + rollups" regime — otherwise a `(symbol, time)` index on MySQL is enough.
 
 ## Implementation checklist
-- [ ] Create OHLCV, trades, and orders/fills tables with `TIMESTAMPTZ` time + `NUMERIC` price/qty.
-- [ ] `SELECT create_hypertable('trades','time', chunk_time_interval => INTERVAL '1 day');` (candles: larger interval, e.g. 7 days).
-- [ ] Composite index `(symbol, time DESC)` — the platform queries "latest N for one symbol".
-- [ ] Idempotent candle writes: `UNIQUE (symbol, interval, bucket)` + `ON CONFLICT ... DO UPDATE`.
-- [ ] Continuous aggregates for 5m/1h/1d from base candles via `time_bucket`; add refresh policies.
-- [ ] Compression policy on chunks older than N days (`segmentby => 'symbol'`, `orderby => 'time DESC'`).
-- [ ] Retention policy: drop raw ticks after ~30 days; keep aggregated candles for years.
-- [ ] Nightly export of finalized history to partitioned Parquet for backtests / cold storage.
+- [ ] Define each table in the shared Drizzle schema with `decimal` for price/qty/PnL and a `(symbol, time)` index where relevant.
+- [ ] Give every replay-prone table a natural unique key and write via `insert().onDuplicateKeyUpdate()`.
+- [ ] Add a guard in `ensure-schema.ts` for every new column/index — never assume a migration ran.
+- [ ] Keep `v3_decision_log` and `v3_position_event` append-only; no update/delete paths.
+- [ ] Read decimals as strings; only `Number(...)`/`BigInt(...)` at the math boundary, then store back as string.
+- [ ] Store Bybit ms timestamps consistently (UTC) and index the time column used for range scans.
 
 ## Do / Don't
-**Do**
-- Store prices, quantities, fees, and PnL as `NUMERIC`/`Decimal`.
-- Store all timestamps as UTC `TIMESTAMPTZ`; bucket with `time_bucket`.
-- Make candle ingestion idempotent so WS reconnect replays don't duplicate rows.
-- Set compression + retention policies so tables don't grow unbounded.
-- Index on `(symbol, time)` because every query filters by symbol and a time range.
-
-**Don't**
-- Don't use `float`/`double precision` for prices — `0.1+0.2` style drift corrupts PnL and triggers.
-- Don't run row-by-row `DELETE` for cleanup on huge tables; use a retention policy (drops chunks).
-- Don't try to `UPDATE`/back-fill inside already-compressed chunks without decompressing first.
-- Don't pick a tiny chunk interval (e.g. 1 hour) for years of data — thousands of chunks slow planning.
-- Don't store only aggregated candles if you'll ever need to re-derive finer resolution — keep raw for the retention window.
+- **Do** use `decimal(precision, scale)` for anything monetary and keep it as a string.
+- **Do** make writes idempotent with `onDuplicateKeyUpdate` on a natural key.
+- **Do** guarantee schema through `ensure-schema.ts` guards, additive and re-runnable.
+- **Don't** add a `drizzle-kit` migration file or destructive `ALTER` to this repo's flow — deploys re-run ensure-schema.
+- **Don't** store prices as `float`/`double` or do `parseFloat` on Bybit strings before persisting.
+- **Don't** `UPDATE`/`DELETE` audit rows — they are the ledger.
+- **Don't** treat DB rows as authoritative for live positions; the exchange is (reconcile pattern).
 
 ## Common pitfalls
-- **Float rounding**: `real`/`double` round ties to even and store approximations; `numeric` is exact and rounds away from zero. Money = `numeric`, always.
-- **Chunk sizing**: too large hurts compression and memory; too small explodes chunk count. Target chunk+indexes ≈ 25% RAM.
-- **CAGG real-time gaps**: without a refresh policy (or `materialized_only=false`), recent buckets may lag; understand the refresh window vs your latest data.
-- **Timezone drift**: mixing local time and UTC makes `time_bucket` boundaries wrong; normalize to UTC at ingest.
-- **Duplicate candles on reconnect**: WS gives overlapping data after a drop — rely on the unique key + upsert.
-- **Writing to compressed chunks**: inserts/updates into compressed chunks need decompression (or newer TimescaleDB's limited support) — plan late-arriving data for the uncompressed window.
+- **Float creep.** A single `Number()` round-trip through storage silently corrupts PnL over many trades — keep decimals as strings.
+- **Missing unique key.** Without a natural unique key, poll replays insert duplicate candles/orders; add the key and upsert.
+- **Forgotten ensure-schema guard.** Code references a column that only exists on your laptop; add the guard so the container has it on boot.
+- **Unindexed time scans.** "Latest snapshot per symbol" without `(symbol, time)` turns into full-table scans as data grows.
+- **Timezone drift.** Mixing local time and Bybit UTC ms produces off-by-hours bugs in candles/events.
 
 ## Code patterns
-```sql
--- OHLCV hypertable with exact numeric prices
-CREATE TABLE ohlcv (
-  symbol   text        NOT NULL,
-  interval text        NOT NULL,          -- '1','5','60','D' (Bybit kline codes)
-  bucket   timestamptz NOT NULL,          -- candle start, UTC
-  open     numeric(38,12) NOT NULL,
-  high     numeric(38,12) NOT NULL,
-  low      numeric(38,12) NOT NULL,
-  close    numeric(38,12) NOT NULL,
-  volume   numeric(38,12) NOT NULL,
-  PRIMARY KEY (symbol, interval, bucket)
-);
-SELECT create_hypertable('ohlcv','bucket', chunk_time_interval => INTERVAL '7 days');
-CREATE INDEX ON ohlcv (symbol, bucket DESC);
 
--- 1h candles as a continuous aggregate from 1m base candles
-CREATE MATERIALIZED VIEW ohlcv_1h
-WITH (timescaledb.continuous) AS
-SELECT symbol,
-       time_bucket('1 hour', bucket) AS bucket,
-       first(open,  bucket) AS open,
-       max(high)            AS high,
-       min(low)             AS low,
-       last(close, bucket)  AS close,
-       sum(volume)          AS volume
-FROM ohlcv WHERE interval = '1'
-GROUP BY symbol, time_bucket('1 hour', bucket);
+```ts
+// packages/db/schema.ts — candles + audit tables, decimals + (symbol,time) index
+import { mysqlTable, varchar, decimal, bigint, int, json, index, uniqueIndex } from "drizzle-orm/mysql-core";
 
-SELECT add_continuous_aggregate_policy('ohlcv_1h',
-  start_offset => INTERVAL '3 hours', end_offset => INTERVAL '1 hour',
-  schedule_interval => INTERVAL '1 hour');
+export const candles = mysqlTable("v3_candle", {
+  symbol:      varchar("symbol", { length: 32 }).notNull(),
+  interval:    varchar("interval", { length: 8 }).notNull(),
+  bucketStart: bigint("bucket_start", { mode: "number" }).notNull(), // Bybit ms
+  open:  decimal("open",  { precision: 38, scale: 12 }).notNull(),
+  high:  decimal("high",  { precision: 38, scale: 12 }).notNull(),
+  low:   decimal("low",   { precision: 38, scale: 12 }).notNull(),
+  close: decimal("close", { precision: 38, scale: 12 }).notNull(),
+  volume:decimal("volume",{ precision: 38, scale: 12 }).notNull(),
+}, (t) => [
+  uniqueIndex("candle_uq").on(t.symbol, t.interval, t.bucketStart), // idempotency key
+  index("candle_symbol_time").on(t.symbol, t.bucketStart),
+]);
 
--- compress chunks >7d, drop raw ticks >30d
-ALTER TABLE trades SET (timescaledb.compress, timescaledb.compress_segmentby = 'symbol');
-SELECT add_compression_policy('trades', INTERVAL '7 days');
-SELECT add_retention_policy('trades', INTERVAL '30 days');
+export const positionEvent = mysqlTable("v3_position_event", {
+  id:       bigint("id", { mode: "number" }).autoincrement().primaryKey(),
+  ts:       bigint("ts", { mode: "number" }).notNull(),
+  botId:    varchar("bot_id", { length: 64 }).notNull(),
+  symbol:   varchar("symbol", { length: 32 }).notNull(),
+  kind:     varchar("kind", { length: 32 }).notNull(),   // opened | closed | tp_hit | drift | ...
+  detail:   json("detail").notNull(),                    // snapshot of exchange vs db
+}, (t) => [ index("posevt_symbol_time").on(t.symbol, t.ts) ]);
 ```
-```python
-# idempotent candle upsert (asyncpg), Decimal in -> Decimal out
-await conn.execute(
-    """INSERT INTO ohlcv(symbol,interval,bucket,open,high,low,close,volume)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-       ON CONFLICT (symbol,interval,bucket)
-       DO UPDATE SET high=GREATEST(ohlcv.high, EXCLUDED.high),
-                     low =LEAST(ohlcv.low,  EXCLUDED.low),
-                     close=EXCLUDED.close, volume=EXCLUDED.volume""",
-    symbol, "1", bucket, o, h, l, c, v)  # o..v are Decimal
+
+```ts
+// Idempotent candle upsert — safe under poll replays
+await db.insert(candles).values(rows)
+  .onDuplicateKeyUpdate({ set: { close: sql`values(${candles.close})`, volume: sql`values(${candles.volume})` } });
+```
+
+```ts
+// ensure-schema.ts — idempotent guards run on boot; NO migration files
+export async function ensureSchema(db: MySql2Database) {
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS v3_candle ( /* ... */ )`);
+  // additive column guard, re-runnable
+  await db.execute(sql`
+    SET @exists := (SELECT COUNT(*) FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name='v3_candle' AND column_name='turnover');`);
+  await db.execute(sql`
+    SET @ddl := IF(@exists=0, 'ALTER TABLE v3_candle ADD COLUMN turnover DECIMAL(38,12) NULL', 'SELECT 1');`);
+  await db.execute(sql`PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;`);
+}
+```
+
+```ts
+// Read decimals as strings; convert only at the math boundary
+const [row] = await db.select().from(candles).where(eq(candles.symbol, "BTCUSDT")).orderBy(desc(candles.bucketStart)).limit(1);
+const close = Number(row.close);   // string -> number ONLY for a calculation
+// ...store any derived money value back as a string into a decimal column
 ```
 
 ## References
-- [TimescaleDB (GitHub)](https://github.com/timescale/timescaledb) — Postgres extension for hypertables, compression, continuous aggregates.
-- [About continuous aggregates — Tiger Data (TimescaleDB) Docs](https://www.tigerdata.com/docs/use-timescale/latest/continuous-aggregates/about-continuous-aggregates) — incremental materialized views, refresh policies, hierarchical rollups.
-- [Continuous aggregates reference — Tiger Data Docs](https://www.tigerdata.com/docs/reference/timescaledb/continuous-aggregates) — CAGG syntax, `time_bucket`, real-time aggregation.
-- [PostgreSQL: Numeric Types](https://www.postgresql.org/docs/current/datatype-numeric.html) — why `numeric` is exact and `float` isn't; rounding behavior for money.
-- [Working with Money in Postgres — Crunchy Data](https://www.crunchydata.com/blog/working-with-money-in-postgres) — `numeric` vs float/money for currency, precision tradeoffs.
-- [InfluxDB vs TimescaleDB — InfluxData](https://www.influxdata.com/comparison/influxdb-vs-timescaledb/) — compression, ingest, and query-model differences.
-- [Comparing InfluxDB, TimescaleDB, and QuestDB — QuestDB](https://questdb.com/blog/comparing-influxdb-timescaledb-questdb-time-series-databases/) — cardinality, compression, and query benchmarks.
-- [Bybit V5 — Get Kline](https://bybit-exchange.github.io/docs/v5/market/kline) — OHLCV response fields (strings), interval codes, epoch-ms timestamps.
+- [Drizzle ORM — MySQL column types](https://orm.drizzle.team/docs/column-types/mysql) — `decimal`, `bigint`, `varchar`, `json`; decimal reads as string.
+- [Drizzle ORM — SQL schema declaration](https://orm.drizzle.team/docs/sql-schema-declaration) — `mysqlTable`, typed columns, inference.
+- [Drizzle ORM — Indexes & Constraints](https://orm.drizzle.team/docs/indexes-constraints) — composite `index()` / `uniqueIndex()` on `(symbol, time)`.
+- [Drizzle ORM — Insert / upsert](https://orm.drizzle.team/docs/insert) — `onDuplicateKeyUpdate` for idempotent writes.
+- [Drizzle ORM — MySQL upsert guide](https://orm.drizzle.team/docs/guides/upsert) — `sql\`values(...)\`` multi-row upsert.
+- [MySQL — Fixed-Point Types (DECIMAL, NUMERIC)](https://dev.mysql.com/doc/refman/8.4/en/fixed-point-types.html) — exact numeric for money.
+- [MySQL — Floating-Point Types](https://dev.mysql.com/doc/refman/8.0/en/floating-point-types.html) — why FLOAT/DOUBLE are approximate (avoid for prices).
+- [Bybit V5 — Get Kline](https://bybit-exchange.github.io/docs/v5/market/kline) — candle arrays returned as strings.
+- [Bybit V5 — Get Trade History (executions)](https://bybit-exchange.github.io/docs/v5/order/execution) — `/v5/execution/list` fills to persist.
+- [TimescaleDB (Postgres extension)](https://github.com/timescale/timescaledb) — hypertables/CAGGs; context for when time-series scaling would justify it.
+- [Understand hypertables — Tiger Data docs](https://www.tigerdata.com/docs/learn/hypertables/understand-hypertables) — chunking/partitioning trade-offs vs plain MySQL.
