@@ -1,211 +1,141 @@
 # RESEARCH.md — Araştırma Özeti ve Kaynakça (TR)
 
-Bu doküman, **Bybit üzerinde Python öncelikli bir çoklu-bot (multibot) kripto trading platformu**
-geliştirirken bir yapay zeka aracının (**Google Antigravity**) kullanacağı **Agent Skills** kataloğunun
-araştırma notlarını, tasarım kararlarını ve tam kaynakçasını içerir.
+Bu doküman, **TypeScript/Bun ile yazılmış, MySQL destekli, polling tabanlı, Bybit üzerinde çalışan
+çoklu-bot bir kripto trading platformunu** geliştiren bir yapay zeka aracının (**Google Antigravity**)
+kullanacağı **Agent Skills** kataloğunun araştırma notlarını, tasarım kararlarını ve kaynakçasını içerir.
+
+> **Not (v2):** Katalog önce Python varsayımıyla yazıldı; ardından paylaşılan **gerçek kod tabanına**
+> göre tümüyle **TypeScript/Bun**'a taşındı. Aşağıdaki her şey v2 (gerçek) duruma göredir.
 
 ---
 
-## 1. Amaç ve kapsam
+## 1. Kod tabanı — temel gerçekler (ground truth)
 
-Hedef: Platformu *geliştiren* AI ajanına domain uzmanlığı kazandıran, açık `SKILL.md` formatında
-skill dosyaları üretmek. Bunlar platformun runtime botları değil; kod yazan ajanın "ne zaman hangi
-bilgiyi yükleyeceğini" bilmesini sağlayan bilgi paketleridir.
+| Katman | Teknoloji |
+|---|---|
+| Dil / runtime | **TypeScript (strict) · Bun** |
+| Repo | **Turborepo** monorepo (`apps/` + `packages/`) |
+| HTTP / API | **Hono** + **tRPC v11** (uçtan uca tipli, Zod input) |
+| Veritabanı | **MySQL + Drizzle ORM** — migration yok, idempotent `ensure-schema.ts` |
+| Arayüz | **React 19 + Vite + TanStack Router/Query + Tailwind v4** |
+| Kimlik / sır | **Better-Auth** (Google + e-posta); API anahtarları **AES-256-GCM** (DB'de); imza **HMAC-SHA256** |
+| Borsa | **Bybit V5** (Unified) — imzalı REST, **polling, WebSocket YOK** |
+| Çalışma şekli | Tek süreç: API/UI + **6 arka plan döngüsü** |
+| Dış | **Google Gemini** (haber sentiment) · **Telegram** (uyarı) · **Dokploy** (deploy) · RSS |
 
-Sabit kısıtlar:
-- **Borsa:** Bybit V5 (Unified Trading Account) — REST + WebSocket, `pybit` ve CCXT/CCXT Pro.
-- **Dil/stack:** Python öncelikli (FastAPI, pandas, asyncio, pydantic).
-- **Format:** Yalnızca dokümantasyon — inline kod snippet'leri var, ayrı `scripts/`/`assets/` yok.
-- **Çıktı yeri:** `.agents/skills/<skill>/SKILL.md` (Antigravity proje kapsamı).
+**6 boot döngüsü:** `ensureSchema → collector (fiyat snapshot) → v3 Bybit motoru (10sn) → optimizer (2sa)
+→ takvim scraper (15dk) → haber scraper (3dk, Gemini sentiment)`.
 
-**Sonuç:** 22 skill / 7 kategori, her biri trigger-yüklü `description` + "ne zaman kullanılır" +
-core concepts + Bybit/Python özellikleri + checklist + Do/Don't + tuzaklar + kod pattern'leri +
-doğrulanmış **References** bölümü. Toplam **~198 benzersiz kaynak linki**.
+**Mimari ilkeler:** *saf çekirdek / kirli kabuk* · *borsa = tek gerçek kaynak, DB = defter (reconcile)* ·
+*polling (event-driven değil)* · *idempotency (`orderLinkId`)* · *audit (`v3_decision_log` / `v3_position_event`)*.
 
-## 2. Google Antigravity skill formatı (araştırma bulgusu)
+## 2. Antigravity skill formatı
 
-Antigravity, Anthropic'in başlattığı **Agent Skills açık standardını** benimsiyor; format Claude Code
-ile birebir aynı:
-- Skill = klasör + zorunlu `SKILL.md` (YAML frontmatter: `name`, `description`) + opsiyonel
-  `references/`, `scripts/`, `assets/`.
-- **Proje kapsamı:** `<proje-kök>/.agents/skills/` · **Global kapsam:** `~/.gemini/config/skills/`.
-- Ayrıca `AGENTS.md` (ajan/rol tanımları) ve `.agents/rules/` (pasif kurallar), global `GEMINI.md`.
-- `description` alanı skill'in tetiklenme anahtarıdır — bu yüzden her skill'de anahtar kelimelerle
-  doldurulmuştur.
-
-Kaynaklar:
+Antigravity, **Agent Skills açık standardını** kullanır (Claude Code ile aynı). Skill = klasör + zorunlu
+`SKILL.md` (frontmatter: `name`, `description`). Proje kapsamı `<kök>/.agents/skills/`, global kapsam
+`~/.gemini/config/skills/`. Ayrıca `AGENTS.md` ve `.agents/rules/`.
 - Agent Skills in Antigravity — https://antigravity.google/docs/skills
-- Authoring Google Antigravity Skills (Codelab) — https://codelabs.developers.google.com/getting-started-with-antigravity-skills
-- Autonomous pipelines with agents.md & skills.md (Codelab) — https://codelabs.developers.google.com/autonomous-ai-developer-pipelines-antigravity
-- Getting Started with Google Antigravity (Codelab) — https://codelabs.developers.google.com/getting-started-google-antigravity
+- Authoring Antigravity Skills (Codelab) — https://codelabs.developers.google.com/getting-started-with-antigravity-skills
 
-## 3. Metodoloji
+## 3. Katalog (24 skill / 8 grup)
 
-1. **Fan-out araştırma:** 22 skill, 7 paralel araştırma ajanına bölündü. Her ajan kendi domain'i için
-   canlı web araması yaptı, resmi kaynakları önceledi.
-2. **Doğrulama:** Linkler arama sonuçlarına karşı teyit edildi. Bybit dokümantasyon sitesi
-   (`bybit-exchange.github.io`) bir JS SPA olduğu ve bot-fetch'e 403 döndüğü için sayfa gövdeleri arama
-   snippet'leriyle doğrulandı; derin path'ler standart `/docs/v5/...` şemasına göre kullanıldı.
-3. **Sentez:** Her skill ortak bir şablona göre yazıldı; tutarlı bölüm sırası ve İngilizce gövde.
-4. **Birleştirme:** README (indeks), AGENTS.md (roller) ve bu doküman (özet + kaynakça) üretildi.
+| Grup | Skill'ler |
+|---|---|
+| ⌂ Mimari | `pure-core-dirty-shell`, `monorepo-turborepo`, `reconcile-source-of-truth` |
+| A · Borsa & Veri (polling) | `exchange-integration-bybit`, `market-data-ingestion`, `rest-polling-and-rate-limits` |
+| B · Trading Mantığı | `strategy-development`, `backtesting-engine`, `order-execution-oms` |
+| C · Risk & Portföy | `risk-management`, `portfolio-management` |
+| D · Orkestrasyon & Veri | `bot-orchestration`, `strategy-config-management`, `mysql-drizzle-data-layer` |
+| E · Backend/UI/Anahtar | `backend-api-service`, `realtime-trading-dashboard`, `api-key-secrets-security` |
+| F · Güvenlik/İzleme/Test | `trading-app-security`, `monitoring-observability`, `testing-paper-trading` |
+| G · DevOps & AI | `deployment-devops-ha`, `parameter-optimizer`, `sentiment-news-signals`, `gemini-ai-integration` |
 
-## 4. Öne çıkan tasarım kararları / tuzaklar
+**v1 → v2 değişimleri:** dil Python→TypeScript/Bun · borsa örnekleri **yalnız Bybit** · WebSocket
+kaldırıldı → `rest-polling-and-rate-limits` · TimescaleDB → `mysql-drizzle-data-layer` · `event-bus-messaging`
+→ `bot-orchestration`'a eritildi · `ml-trading-signals` → `parameter-optimizer` · `llm-agent-integration`
+→ `gemini-ai-integration` · **yeni:** `pure-core-dirty-shell`, `monorepo-turborepo`, `reconcile-source-of-truth`.
 
-- **Sermaye güvenliği:** Canlıdan önce testnet/demo; API anahtarlarında **withdraw kapalı + IP
-  whitelist zorunlu**; global **kill switch**; canlıya geçmeden parametre doğrulama.
-- **Look-ahead / veri sızıntısı yok:** Backtesting, strateji ve ML skill'lerinde zorunlu kılındı
-  (next-bar fill, purged K-fold + embargo, triple-barrier labeling).
-- **Idempotency:** `orderLinkId` (≤36 karakter) ve `Idempotency-Key` ile retry'lerde çift emir önleme.
-- **Bybit özgü gerçekler:** WS 20s ping / 10dk idle cutoff; kline dizi sırası `[start,open,high,low,
-  close,volume,turnover]` ve en yeni-önce, 1000 satır limiti; private WS auth `"GET/realtime"+expires`;
-  HTTP 403 = 10dk IP ban; demo trading mainnet tabanlı (~50k USDT seed, private-WS only).
+## 4. Metodoloji
 
-## 5. Kaynakça (kategori bazında)
+- **Fan-out araştırma:** 24 skill, 8 paralel araştırma ajanına bölündü; her ajan kendi domain'i için canlı
+  web araması yaptı, resmi kaynakları önceledi (Bybit V5, Bun, Hono, tRPC, Drizzle, TanStack, Better-Auth,
+  Zod, Turborepo, Gemini, OWASP).
+- **Doğrulama:** Linkler arama sonuçlarına karşı teyit edildi. Bazı doküman siteleri (bybit-exchange.github.io,
+  ai.google.dev, docs.dokploy.com, orm.drizzle.team) bot-fetch'e 403 döndüğü için sayfa gövdeleri arama
+  snippet'leriyle doğrulandı; derin path'ler resmi şemaya göre kullanıldı.
+- **Sentez:** Her skill ortak şablonla, TypeScript-only snippet'lerle, İngilizce gövdeyle yazıldı.
 
-> Her skill'in kendi `SKILL.md` dosyasının sonunda tam ve doğrulanmış **References** bölümü vardır.
-> Aşağıda konsolide edilmiş liste yer alır.
+## 5. Öne çıkan tasarım kararları / tuzaklar (v2)
 
-### A · Exchange & Market Data
-**Bybit V5 resmi dokümanları**
-- Introduction — https://bybit-exchange.github.io/docs/v5/intro
-- Integration Guidance (auth/signing) — https://bybit-exchange.github.io/docs/v5/guide
-- Rate Limit Rules — https://bybit-exchange.github.io/docs/v5/rate-limit
-- Error Codes — https://bybit-exchange.github.io/docs/v5/error
-- Get Instruments Info — https://bybit-exchange.github.io/docs/v5/market/instrument
-- Get Kline — https://bybit-exchange.github.io/docs/v5/market/kline
-- Get Recent Public Trades — https://bybit-exchange.github.io/docs/v5/market/recent-trade
-- Get Funding Rate History — https://bybit-exchange.github.io/docs/v5/market/history-fund-rate
-- Get Open Interest — https://bybit-exchange.github.io/docs/v5/market/open-interest
-- Get Tickers — https://bybit-exchange.github.io/docs/v5/market/tickers
-- Get Orderbook — https://bybit-exchange.github.io/docs/v5/market/orderbook
-- Get Server Time — https://bybit-exchange.github.io/docs/v5/market/time
-- Demo Trading Service — https://bybit-exchange.github.io/docs/v5/demo
-- WebSocket Connect — https://bybit-exchange.github.io/docs/v5/ws/connect
-- WS Public Orderbook — https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook
-- WS Public Trade — https://bybit-exchange.github.io/docs/v5/websocket/public/trade
-- WS Public Ticker — https://bybit-exchange.github.io/docs/v5/websocket/public/ticker
-- WS Public Kline — https://bybit-exchange.github.io/docs/v5/websocket/public/kline
-- WS Private Order — https://bybit-exchange.github.io/docs/v5/websocket/private/order
-- WS Private Execution — https://bybit-exchange.github.io/docs/v5/websocket/private/execution
+- **Saf çekirdek / kirli kabuk:** Karar matematiği (`packages/`) saf, deterministik, `bun test` ile test
+  edilir; borsa/DB/Telegram yan etkileri ince motor dosyalarında. (Bilinen sapma: Bybit motorunun mantığı
+  inline kopyalaması — `pure-core-dirty-shell` bunu düzeltmeyi hedefler.)
+- **Reconcile:** Her tick borsadan gerçek pozisyonları çekip DB'yi eşitler; karar öncesi drift/orphan/partial
+  fill tespiti; snapshot başarısızsa karar verme.
+- **Polling & rate-limit:** `AbortSignal.timeout` ile fetch timeout, backoff+jitter, döngüler arası paylaşılan
+  Bybit rate-limit bütçesi, single-flight (üst üste binen tick yok), 403/429/10006 yönetimi.
+- **Idempotency:** `orderLinkId` ile retry'de çift emir önleme; MARKET giriş + reduce-only MARKET çıkış.
+- **Sır güvenliği:** AES-256-GCM (kayıt başına rastgele IV + auth tag, env master key), yalnız imza anında
+  bellekte çöz; withdraw kapalı + IP whitelist Bybit anahtarları; sır loglama yok.
+- **Şema:** Migration dosyası yok; idempotent `ensure-schema.ts` ALTER guard'ları; fiyatlar DECIMAL/string
+  (float değil).
 
-**SDK / kütüphaneler**
-- pybit (resmi Python SDK) — https://github.com/bybit-exchange/pybit
-- pybit (PyPI) — https://pypi.org/project/pybit/
-- pybit v5 WebSocket örnekleri — https://dev.to/kylefoo/pybit-v5-how-to-subscribe-to-websocket-topics-1iem
-- CCXT documentation — https://docs.ccxt.com/
-- CCXT bybit implementation — https://github.com/ccxt/ccxt/blob/master/python/ccxt/bybit.py
-- CCXT Pro manual — https://docs.ccxt.com/ccxt.pro.manual
+## 6. Kaynakça (kategori bazında)
 
-### B · Trading Logic (strateji / backtest / execution)
-- Freqtrade — Strategy Customization — https://www.freqtrade.io/en/stable/strategy-customization/
-- Freqtrade — Advanced Strategy — https://www.freqtrade.io/en/stable/strategy-advanced/
-- Freqtrade — Lookahead analysis — https://www.freqtrade.io/en/stable/lookahead-analysis/
-- Freqtrade — Recursive analysis — https://www.freqtrade.io/en/stable/recursive-analysis/
-- Freqtrade — Backtesting — https://www.freqtrade.io/en/stable/backtesting/
-- Freqtrade — Hyperopt — https://www.freqtrade.io/en/stable/hyperopt/
-- pandas-ta (PyPI) — https://pypi.org/project/pandas-ta/
-- pandas-ta docs — https://www.pandas-ta.dev/
-- TA-Lib Python docs — https://ta-lib.github.io/ta-lib-python/
-- TA-Lib functions — https://ta-lib.github.io/ta-lib-python/funcs.html
-- TA-Lib GitHub — https://github.com/TA-Lib/ta-lib-python
-- Jesse — https://jesse.trade/ · GitHub — https://github.com/jesse-ai/jesse
-- backtesting.py — https://kernc.github.io/backtesting.py/ · API — https://kernc.github.io/backtesting.py/doc/backtesting/backtesting.html
-- vectorbt — https://vectorbt.dev/ · GitHub — https://github.com/polakowo/vectorbt
-- QuantStats — https://github.com/ranaroussi/quantstats
-- Bybit V5 — Place/Amend/Cancel Order — https://bybit-exchange.github.io/docs/v5/order/create-order · https://bybit-exchange.github.io/docs/v5/order/amend-order · https://bybit-exchange.github.io/docs/v5/order/cancel-order
-- Bybit V5 — Set Trading Stop — https://bybit-exchange.github.io/docs/v5/position/trading-stop
-- Bybit V5 — Switch Position Mode — https://bybit-exchange.github.io/docs/v5/position/position-mode
-- Bybit V5 — Set Leverage — https://bybit-exchange.github.io/docs/v5/position/leverage
-- Bybit V5 — Fee Rate — https://bybit-exchange.github.io/docs/v5/account/fee-rate
+> Her skill'in `SKILL.md` sonunda tam ve doğrulanmış **References** bölümü vardır (~190 benzersiz kaynak).
 
-### C · Risk & Portfolio
-- Bybit — Liquidation Price (Isolated, UTA) — https://www.bybit.com/en/help-center/article/Liquidation-Price-Calculation-under-Isolated-Mode-Unified-Trading-Account
-- Bybit — UTA Trading Rules / Liquidation Process — https://www.bybit.com/en/help-center/article/UTA-Trading-Rules
-- Bybit — Maintenance Margin (USDT Perp) — https://www.bybit.com/en/help-center/article/Maintenance-Margin-USDT-Contract
-- Bybit — Risk Limit — https://www.bybit.com/en/help-center/article/Risk-Limit-Perpetual-and-Futures
-- Bybit — Margin Parameters — https://www.bybit.com/en/announcement-info/margin-parameters/
-- Bybit — P&L Calculations — https://www.bybit.com/en/help-center/article/Profit-Loss-calculations-USDT-Contract
-- Bybit — Funding Fee Calculation — https://www.bybit.com/en/help-center/article/Funding-fee-calculation
-- Bybit — Introduction to Funding Rate — https://www.bybit.com/en/help-center/article/Introduction-to-Funding-Rate
-- Bybit — Create Sub UID (+ API Key) — https://bybit-exchange.github.io/docs/v5/user/create-subuid · https://bybit-exchange.github.io/docs/v5/user/create-subuid-apikey
-- Freqtrade — Protections — https://www.freqtrade.io/en/stable/plugins/ · Stoploss — https://www.freqtrade.io/en/stable/stoploss/
-- Kelly Criterion & Position Sizing — https://coriva.eu.org/en/kelly-criterion-position-sizing/
-- Modern Portfolio Theory (CFI) — https://corporatefinanceinstitute.com/resources/career-map/sell-side/capital-markets/modern-portfolio-theory-mpt/
-- Hummingbot docs — https://hummingbot.org/docs/ · Hummingbot API — https://github.com/hummingbot/hummingbot-api
-- Celery vs ARQ — https://leapcell.io/blog/celery-versus-arq-choosing-the-right-task-queue-for-python-applications
-- Concurrency: multiprocessing vs asyncio — https://testdriven.io/blog/concurrency-parallelism-asyncio/
+### Platform / stack (çekirdek)
+- Bun — Docs — https://bun.com/docs · Test runner — https://bun.com/docs/test · Hashing/CryptoHasher — https://bun.com/docs/runtime/hashing · Workspaces — https://bun.com/docs/pm/workspaces · bun audit — https://bun.com/docs/pm/cli/audit
+- Hono — https://hono.dev/docs/ · RPC — https://hono.dev/docs/guides/rpc · Better-Auth örneği — https://hono.dev/examples/better-auth
+- tRPC — Procedures — https://trpc.io/docs/server/procedures · Context — https://trpc.io/docs/server/context · Middlewares — https://trpc.io/docs/server/middlewares · Error handling/formatting — https://trpc.io/docs/server/error-handling · TanStack setup — https://trpc.io/docs/client/tanstack-react-query/setup · @hono/trpc-server — https://www.npmjs.com/package/@hono/trpc-server
+- Drizzle ORM — MySQL — https://orm.drizzle.team/docs/get-started/mysql-new · Schema — https://orm.drizzle.team/docs/sql-schema-declaration · Column types — https://orm.drizzle.team/docs/column-types/mysql · Indexes/constraints — https://orm.drizzle.team/docs/indexes-constraints · Transactions — https://orm.drizzle.team/docs/transactions · Insert/Upsert — https://orm.drizzle.team/docs/insert · https://orm.drizzle.team/docs/guides/upsert
+- Zod — https://zod.dev/ · API — https://zod.dev/api
+- Better-Auth — Hono — https://better-auth.com/docs/integrations/hono · Session — https://better-auth.com/docs/concepts/session-management · 2FA — https://better-auth.com/docs/plugins/2fa · Cookies — https://better-auth.com/docs/concepts/cookies · Security — https://better-auth.com/docs/reference/security
+- Turborepo — Structuring — https://turborepo.dev/docs/crafting-your-repository/structuring-a-repository · Tasks — https://turborepo.dev/docs/crafting-your-repository/configuring-tasks · Config — https://turborepo.dev/docs/reference/configuration · Internal packages — https://turborepo.dev/docs/core-concepts/internal-packages · TypeScript — https://turborepo.dev/docs/guides/tools/typescript
+- Better-T-Stack (referans şablon) — https://github.com/AmanVarshney01/Better-T-Stack
+- Node crypto — https://nodejs.org/api/crypto.html · createCipheriv — https://nodejs.org/api/crypto.html#cryptocreatecipherivalgorithm-key-iv-options
+- MDN — fetch — https://developer.mozilla.org/en-US/docs/Web/API/Window/fetch · AbortController — https://developer.mozilla.org/en-US/docs/Web/API/AbortController · AbortSignal.timeout — https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/timeout_static · SubtleCrypto — https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto
 
-### D · Config & Data Infra
-- Pydantic — Settings Management — https://docs.pydantic.dev/latest/concepts/pydantic_settings/
-- Pydantic — Migration Guide — https://docs.pydantic.dev/latest/migration/ · Validators — https://docs.pydantic.dev/latest/concepts/validators/ · Models — https://docs.pydantic.dev/latest/concepts/models/
-- TimescaleDB (GitHub) — https://github.com/timescale/timescaledb
-- Continuous aggregates — https://www.tigerdata.com/docs/use-timescale/latest/continuous-aggregates/about-continuous-aggregates
-- PostgreSQL Numeric Types — https://www.postgresql.org/docs/current/datatype-numeric.html
-- Working with Money in Postgres (Crunchy) — https://www.crunchydata.com/blog/working-with-money-in-postgres
-- InfluxDB vs TimescaleDB — https://www.influxdata.com/comparison/influxdb-vs-timescaledb/
-- InfluxDB vs TimescaleDB vs QuestDB — https://questdb.com/blog/comparing-influxdb-timescaledb-questdb-time-series-databases/
-- Redis Streams — https://redis.io/docs/latest/develop/data-types/streams/ (XREADGROUP / XACK / XPENDING)
-- Apache Kafka docs — https://kafka.apache.org/documentation/ · Exactly-once (Confluent) — https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/
-- NATS JetStream Consumers — https://docs.nats.io/nats-concepts/jetstream/consumers · Compare NATS — https://docs.nats.io/nats-concepts/overview/compare-nats
+### Frontend
+- TanStack Query — Polling — https://tanstack.com/query/latest/docs/framework/react/guides/polling · useQuery — https://tanstack.com/query/v5/docs/framework/react/reference/useQuery · Optimistic — https://tanstack.com/query/v5/docs/framework/react/guides/optimistic-updates
+- @trpc/tanstack-react-query — https://www.npmjs.com/package/@trpc/tanstack-react-query
+- TanStack Router — createRouter — https://tanstack.com/router/latest/docs/guide/creating-a-router · file-based — https://tanstack.com/router/latest/docs/routing/file-based-routing
+- Tailwind v4 — Vite — https://tailwindcss.com/docs/installation/using-vite · v4 blog — https://tailwindcss.com/blog/tailwindcss-v4
+- TradingView Lightweight Charts — Docs — https://tradingview.github.io/lightweight-charts/docs · React — https://tradingview.github.io/lightweight-charts/tutorials/react/simple · v4→v5 — https://tradingview.github.io/lightweight-charts/docs/migrations/from-v4-to-v5
 
-### E · Backend, UI & Keys
-- FastAPI — https://fastapi.tiangolo.com/ · OAuth2 scopes — https://fastapi.tiangolo.com/advanced/security/oauth2-scopes/ · WebSockets — https://fastapi.tiangolo.com/advanced/websockets/ · Background Tasks — https://fastapi.tiangolo.com/tutorial/background-tasks/
-- Uvicorn — https://www.uvicorn.org/ · slowapi — https://github.com/laurentS/slowapi · structlog — https://www.structlog.org/en/stable/
-- Securing FastAPI with JWT (TestDriven) — https://testdriven.io/blog/fastapi-jwt-auth/
-- Auth & AuthZ with FastAPI (Better Stack) — https://betterstack.com/community/guides/scaling-python/authentication-fastapi/
-- TradingView Lightweight Charts — https://tradingview.github.io/lightweight-charts/docs · Series types — https://tradingview.github.io/lightweight-charts/docs/series-types · Markers — https://tradingview.github.io/lightweight-charts/tutorials/how_to/series-markers · Realtime demo — https://tradingview.github.io/lightweight-charts/tutorials/demos/realtime-updates · API — https://tradingview.github.io/lightweight-charts/docs/api · GitHub — https://github.com/tradingview/lightweight-charts
-- Bybit — Create/Modify/Info API Key — https://bybit-exchange.github.io/docs/v5/user/create-subuid-apikey · https://bybit-exchange.github.io/docs/v5/user/modify-master-apikey · https://bybit-exchange.github.io/docs/v5/user/apikey-info
-- Bybit Help — Create API Key — https://www.bybit.com/en/help-center/article/How-to-create-your-API-key
-- cryptography — Fernet — https://cryptography.io/en/stable/fernet/
-- HashiCorp Vault — Transit — https://developer.hashicorp.com/vault/docs/secrets/transit
-- OWASP — Secrets Management Cheat Sheet — https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html
+### Bybit V5 (resmi doküman)
+- Introduction — https://bybit-exchange.github.io/docs/v5/intro · Integration Guidance (auth/signing) — https://bybit-exchange.github.io/docs/v5/guide · Rate Limit — https://bybit-exchange.github.io/docs/v5/rate-limit · Error Codes — https://bybit-exchange.github.io/docs/v5/error · Server Time — https://bybit-exchange.github.io/docs/v5/market/time · Demo Trading — https://bybit-exchange.github.io/docs/v5/demo
+- Market: Kline — https://bybit-exchange.github.io/docs/v5/market/kline · Instruments — https://bybit-exchange.github.io/docs/v5/market/instrument · Tickers — https://bybit-exchange.github.io/docs/v5/market/tickers · Orderbook — https://bybit-exchange.github.io/docs/v5/market/orderbook · Funding History — https://bybit-exchange.github.io/docs/v5/market/history-fund-rate · Open Interest — https://bybit-exchange.github.io/docs/v5/market/open-interest · Long/Short Ratio — https://bybit-exchange.github.io/docs/v5/market/long-short-ratio
+- Order: Create — https://bybit-exchange.github.io/docs/v5/order/create-order · Cancel — https://bybit-exchange.github.io/docs/v5/order/cancel-order · Open/Closed — https://bybit-exchange.github.io/docs/v5/order/open-order
+- Position: Info — https://bybit-exchange.github.io/docs/v5/position · Trading Stop — https://bybit-exchange.github.io/docs/v5/position/trading-stop · Position Mode — https://bybit-exchange.github.io/docs/v5/position/position-mode · Leverage — https://bybit-exchange.github.io/docs/v5/position/leverage
+- Account: Wallet Balance — https://bybit-exchange.github.io/docs/v5/account/wallet-balance · Closed PnL — https://bybit-exchange.github.io/docs/v5/position/close-pnl · Transaction Log — https://bybit-exchange.github.io/docs/v5/account/transaction-log · Fee Rate — https://bybit-exchange.github.io/docs/v5/account/fee-rate
+- User (API keys): Create Sub API Key — https://bybit-exchange.github.io/docs/v5/user/create-subuid-apikey · API Key Info — https://bybit-exchange.github.io/docs/v5/user/apikey-info
+- Help Center: Create API Key — https://www.bybit.com/en/help-center/article/How-to-create-your-API-key · Liquidation Price (UTA) — https://www.bybit.com/en/help-center/article/Liquidation-Price-Calculation-under-Isolated-Mode-Unified-Trading-Account · Maintenance Margin — https://www.bybit.com/en/help-center/article/Maintenance-Margin-USDT-Contract · P&L Calc — https://www.bybit.com/en/help-center/article/Profit-Loss-calculations-USDT-Contract · Funding Fee — https://www.bybit.com/en/help-center/article/Funding-fee-calculation · Demo Trading FAQ — https://www.bybit.com/en/help-center/article/FAQ-Demo-Trading
 
-### F · Security, Monitoring & Testing
-- OWASP Top 10:2021 — https://owasp.org/Top10/2021/ · API Security Top 10 — https://owasp.org/API-Security/ · ASVS — https://owasp.org/www-project-application-security-verification-standard/ (GitHub — https://github.com/OWASP/ASVS)
-- PyOTP — https://github.com/pyauth/pyotp · docs — https://pyauth.github.io/pyotp/
-- pip-audit — https://github.com/pypa/pip-audit · PyPI — https://pypi.org/project/pip-audit/
-- Securing the Python Supply Chain — https://bernat.tech/posts/securing-python-supply-chain/
-- Idempotency (Google Cloud) — https://cloud.google.com/discover/idempotency
-- Prometheus client_python — https://github.com/prometheus/client_python · Metric types — https://prometheus.io/docs/concepts/metric_types/ · Alerting rules — https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/
-- prometheus-fastapi-instrumentator — https://github.com/trallnag/prometheus-fastapi-instrumentator
-- Grafana — Alertmanager — https://grafana.com/docs/grafana/latest/alerting/set-up/configure-alertmanager/ · Alert rules — https://grafana.com/docs/grafana/latest/alerting/fundamentals/alert-rules/
-- OpenTelemetry Python — https://opentelemetry.io/docs/languages/python/ (Instrumentation — https://opentelemetry.io/docs/languages/python/instrumentation/)
-- Google SRE — SLOs — https://sre.google/sre-book/service-level-objectives/ · Alerting on SLOs — https://sre.google/workbook/alerting-on-slos/ · Error Budget Policy — https://sre.google/workbook/error-budget-policy/
-- Bybit — Request Test Coins on Testnet — https://www.bybit.com/en/help-center/article/How-to-Request-Test-Coins-on-Testnet
-- pytest — https://docs.pytest.org/en/stable/ · pytest-asyncio — https://pytest-asyncio.readthedocs.io/en/latest/
-- Hypothesis — https://hypothesis.readthedocs.io/en/latest/ · responses — https://github.com/getsentry/responses · respx — https://lundberg.github.io/respx/ · freezegun — https://github.com/spulec/freezegun
-- Freqtrade — Bot basics (dry-run vs live) — https://www.freqtrade.io/en/stable/bot-basics/
+### Test / kalite / mimari
+- Vitest — https://vitest.dev/guide/ · fast-check — https://fast-check.dev/ · (Bun ile) — https://fast-check.dev/docs/tutorials/setting-up-your-test-environment/property-based-testing-with-bun-test-runner/
+- Functional core / imperative shell — https://www.destroyallsoftware.com/screencasts/catalog/functional-core-imperative-shell · https://functional-architecture.org/functional_core_imperative_shell/
+- Functional DI (TS) — https://hassannteifeh.medium.com/functional-dependency-injection-in-typescript-4c2739326f57
 
-### G · DevOps & AI
-- Docker — Dockerfile reference — https://docs.docker.com/reference/dockerfile/ · Compose secrets — https://docs.docker.com/compose/how-tos/use-secrets/ · container stop — https://docs.docker.com/reference/cli/docker/container/stop/
-- Kubernetes — Pod termination — https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination · Coordinated Leader Election — https://kubernetes.io/docs/concepts/cluster-administration/coordinated-leader-election/ · Leader election blog — https://kubernetes.io/blog/2016/01/simple-leader-election-with-kubernetes/
-- systemd.service — https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html · chrony/NTP — https://chrony-project.org/documentation.html
-- Redis distributed locks (Redlock) — https://redis.io/docs/latest/develop/use/patterns/distributed-locks/
-- Advances in Financial ML — López de Prado (Wiley) — https://www.wiley.com/en-us/Advances+in+Financial+Machine+Learning-p-9781119482086 · Ch.3 Labeling — https://www.oreilly.com/library/view/advances-in-financial/9781119482086/c03.xhtml
-- Purged cross-validation (Wikipedia) — https://en.wikipedia.org/wiki/Purged_cross-validation
-- The 10 Reasons Most ML Funds Fail (GARP) — https://www.garp.org/hubfs/Whitepapers/a1Z1W0000054x6lUAA.pdf
-- mlfinlab — https://www.mlfinlab.com/
-- scikit-learn — TimeSeriesSplit — https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.TimeSeriesSplit.html · Cross-validation — https://scikit-learn.org/stable/modules/cross_validation.html
-- FreqAI — Intro — https://www.freqtrade.io/en/stable/freqai/ · Feature engineering — https://www.freqtrade.io/en/stable/freqai-feature-engineering/ · Parameters — https://www.freqtrade.io/en/stable/freqai-parameter-table/
-- Bybit — Long/Short Ratio — https://bybit-exchange.github.io/docs/v5/market/long-short-ratio
-- VADER Sentiment — https://github.com/cjhutto/vaderSentiment · FinBERT (ProsusAI) — https://huggingface.co/ProsusAI/finbert · Transformers pipelines — https://huggingface.co/docs/transformers/main_classes/pipelines
-- PRAW (Reddit) — https://praw.readthedocs.io/ · X API v2 — https://developer.x.com/en/docs/x-api · CryptoPanic API — https://cryptopanic.com/developers/api/
-- Glassnode — Metric Catalog — https://docs.glassnode.com/data/metric-catalog · Indicators — https://docs.glassnode.com/basic-api/endpoints/indicators
-- Claude — Tool use overview — https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview · Implement tool use — https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use · Structured outputs — https://platform.claude.com/docs/en/build-with-claude/structured-outputs · Prompt caching — https://platform.claude.com/docs/en/build-with-claude/prompt-caching · Advanced tool use — https://www.anthropic.com/engineering/advanced-tool-use
-- OpenAI — Function calling — https://platform.openai.com/docs/guides/function-calling · Structured Outputs — https://platform.openai.com/docs/guides/structured-outputs
-- OWASP Top 10 for LLM Applications — https://owasp.org/www-project-top-10-for-large-language-model-applications/
+### Güvenlik / izleme / deploy
+- OWASP — Top 10:2021 — https://owasp.org/Top10/2021/ · API Security Top 10 — https://owasp.org/API-Security/ · ASVS — https://owasp.org/www-project-application-security-verification-standard/ · Secrets Mgmt — https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html · Cryptographic Storage — https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html · LLM Top 10 — https://owasp.org/www-project-top-10-for-large-language-model-applications/
+- Telegram Bot API (sendMessage) — https://core.telegram.org/bots/api#sendmessage · pino — https://getpino.io/ · Google SRE SLOs — https://sre.google/sre-book/service-level-objectives/
+- Dokploy — Docs/GitHub (push-to-main auto build/deploy) · Docker — Dockerfile reference — https://docs.docker.com/reference/dockerfile/ · container stop (SIGTERM) — https://docs.docker.com/reference/cli/docker/container/stop/ · oven/bun (Docker) — https://hub.docker.com/r/oven/bun · chrony/NTP — https://chrony-project.org/documentation.html
+
+### AI (Gemini) & optimizer
+- Google Gemini — @google/genai (npm) — https://www.npmjs.com/package/@google/genai · js-genai (GitHub) — https://github.com/googleapis/js-genai · Structured output — https://ai.google.dev/gemini-api/docs/structured-output · Rate limits — https://ai.google.dev/gemini-api/docs/rate-limits · Pricing — https://ai.google.dev/gemini-api/docs/pricing
+- RSS — rss-parser (npm) — https://www.npmjs.com/package/rss-parser · fast-xml-parser — https://www.npmjs.com/package/fast-xml-parser
+- Parametre optimizasyonu — Advances in Financial ML (López de Prado) — https://www.wiley.com/en-us/Advances+in+Financial+Machine+Learning-p-9781119482086 · Walk-forward (IBKR) · Purged CV (Wikipedia) — https://en.wikipedia.org/wiki/Purged_cross-validation · Hyperparameter optimization — https://en.wikipedia.org/wiki/Hyperparameter_optimization
 
 ---
 
-## 6. Sabahki session için notlar
+## 7. Sabahki session için notlar
 
-- Katalog eksiksiz (22/22 skill) ve `claude/crypto-trading-ai-skills-8juz86` dalına push edildi.
-- Sonraki adımlar için öneriler:
-  1. **Derin link doğrulama:** Bazı Bybit derin path'leri arama snippet'leriyle teyit edildi; canlı
-     WebFetch ile tek tek doğrulanabilir.
-  2. **`.agents/rules/` ekleme:** Platforma özel pasif kurallar (ör. "canlı emir yalnızca risk-management
-     checklist geçtiyse").
-  3. **İkinci tur derinleştirme:** İstenen skill'lere `references/` alt-dokümanları veya örnek şablonlar
-     eklenebilir.
-  4. **Skill'leri gerçek repoda deneme:** Antigravity'de `.agents/skills/` altına koyup tetikleyicilerin
-     doğru çalıştığını gözlemleme.
+- Katalog eksiksiz (24/24 skill, TypeScript/Bun) ve `claude/crypto-trading-ai-skills-8juz86` dalına push edildi.
+- Sonraki adım önerileri:
+  1. **Repoyu ekleyip birebir hizalama:** Gerçek dosya/tablo/paket adlarını (`packages/*`, gerçek tablo şeması)
+     okuyup skill'lerdeki örnek isimleri koda tam uydurma.
+  2. **`.agents/rules/` ekleme:** Pasif kurallar (ör. "canlı emir yalnız risk checklist + reconcile geçtiyse";
+     "yeni karar mantığı yalnız `packages/` saf çekirdeğinde").
+  3. **Bybit motoru refactor'ı:** `pure-core-dirty-shell` skill'ini rehber alarak inline kopyayı saf çekirdeğe taşıma.
+  4. **Antigravity'de deneme:** `.agents/skills/` altını yükleyip tetikleyicilerin doğru çalıştığını gözlemleme.
