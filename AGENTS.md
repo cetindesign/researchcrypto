@@ -41,6 +41,13 @@ The single-process, 6-loop runtime, its config, and the multi-bot fleet.
 The delta-neutral funding-carry role (engine change: spot leg + two-leg fills).
 - Skills: `market-neutral-funding`, `fleet-coordination`, `reconcile-source-of-truth`
 
+### 4c. 🎯 Avcı (Hunter) Momentum Engineer
+The momentum/breakout role — most aggressive, least proven (10-15% of fleet capital). **Read
+`avci-signal-validation-rollout` FIRST: Gate-0 requires decomposing the L1 34% baseline's payoff ratio before
+building anything.** Discipline: 34% win rate is normal positive-skew; confluence cuts trade count, not win rate.
+- Skills: `avci-breakout-confluence`, `avci-volume-volatility-confirmation`, `avci-volatility-position-sizing`,
+  `avci-taker-entry-slippage-guard`, `avci-regime-timing-standdown`, `avci-signal-validation-rollout`
+
 ### 5. Backend & Frontend Engineer
 The Hono/tRPC control plane, the React panel, and the AI assistant.
 - Skills: `backend-api-service`, `realtime-trading-dashboard`, `gemini-ai-integration`
@@ -62,10 +69,17 @@ When implementing the SkyPower V3 fleet, follow the report's sequence:
   `market-data-ingestion`, `parameter-optimizer`).
 - **Faz C — last:** `market-neutral-funding` (Safra — spot leg + two-leg execution = engine change).
 
-**Iron rules for this strategy:** entries are **maker post-only** (not MARKET); every role must pass
-`strategy-validation-protocol` (cost-adjusted PF ≥ 1.3, ≥300 trades, +EV, 2 regimes) before real capital;
-one bot per symbol (`fleet-coordination` lock); DCA-on-loss stays OFF; the live frequency optimizer stays OFF.
+**Iron rules for this strategy:** entries are **maker post-only** (not MARKET) — **except Avcı, which takes on
+genuine breakouts** via `avci-taker-entry-slippage-guard`; every role must pass `strategy-validation-protocol`
+(cost-adjusted PF ≥ 1.3, ≥300 trades, +EV, 2 regimes) before real capital; one bot per symbol
+(`fleet-coordination` lock); DCA-on-loss stays OFF; the live frequency optimizer stays OFF.
+
+**Avcı-specific (group I):** before writing/optimizing Avcı, run **Gate-0** (`avci-signal-validation-rollout`) —
+decompose the L1 34% baseline's avg_win/avg_loss/payoff (breakeven ≈1.94R at 34%); if payoff is already healthy,
+fix the too-tight 0.8% trailing exit (`atr-adaptive-exits`) instead of redesigning the signal. Ship the v1 trio
+first (vol-scaled sizing + closed-bar signal + volume/volatility confirmation); hold MTF/RS/MACD/RSI/ORB behind
+flags until each earns its keep out-of-sample. Never stack filters to chase win rate.
 
 ---
-See [`README.md`](README.md) for the full 32-skill catalog and [`RESEARCH.md`](RESEARCH.md) for the
+See [`README.md`](README.md) for the full 38-skill catalog and [`RESEARCH.md`](RESEARCH.md) for the
 research notes and source bibliography (Türkçe özet dahil).

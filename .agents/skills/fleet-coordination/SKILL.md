@@ -169,6 +169,36 @@ async function releaseSymbolLock(db: DrizzleDb, symbol: string, botId: string) {
 // On reconcile: for each lock with no matching live position on the exchange, release it (frees orphans).
 ```
 
+## Avcı profile (correlation cap + STANDDOWN wiring for the Hunter's 2 slots)
+
+Avcı is **Tier-A+B with a HIGHER signal threshold** (it pays for worse Tier-B fills with more selectivity), gets **10–15% of fleet capital**, and runs `coin_count 2`. Its two concurrent slots need concentration controls the fleet-wide gross/net caps don't fully catch, plus a hard wire from the regime standdown.
+
+**Avcı's 2 slots are ~1.5× ONE bet, not two.** `coin_count 2` forced into **top-quintile relative strength in a BTC-up regime** means both slots are the strongest-beta names moving with BTC — in a momentum crash / V-recovery both gap through stops together (the critic's correlated-positions weakness). So add, **on top of** the existing fleet gross + net-directional caps, an **Avcı-internal correlation/concentration cap**: treat correlated BTC/ETH/L1 majors as **one basket** and forbid Avcı from holding both slots in the same basket (or cap the summed beta-weighted notional of Avcı's 2 slots). Two independent bets require two *uncorrelated* baskets; otherwise the second slot is denied (`reason: "avci_correlation_basket"`). This reuses the same beta-to-BTC basket logic as `fleetExposureOk`, scoped to Avcı's live positions. The single-symbol cap (≤30% of role budget, applied AFTER pyramiding) lives in `avci-volatility-position-sizing`; this cap is the *cross-symbol* complement.
+
+**Wire regime STANDDOWN into fleet capital.** From `avci-regime-timing-standdown`, `regimeGate` maps regime → `coin_count`: RISK-ON → 2, CAUTION → 1, CRASH → **`standdown_coin_count: 0`**. When STANDDOWN fires, Avcı's effective `coin_count` is **zeroed** — it opens nothing and its budget goes idle — while **Kayıkçı and Safra continue** on their own regime rules (Kayıkçı still honors the neutral-halt from `regime-detection`; Safra's delta-neutral carry is regime-agnostic). STANDDOWN never force-closes Avcı's open positions — exits keep managing themselves; it only zeroes NEW slots. Confirm the role split holds: Avcı Tier-A+B / higher threshold / 10–15% capital / `profit_layer_enabled 1` (the only pyramiding role), against Kayıkçı Tier-A-only / no layering / 35–40%, Safra 25–30%, Reserve 20–25%.
+
+NEW fleet keys for the Avcı profile (conservative defaults, offline-swept only, never live-optimized under `optimizer_enabled: 0`): `correlation_cap` (max beta-weighted notional across Avcı's 2 slots, or "1 basket"), `standdown_coin_count` (0). These sit alongside the existing per-role `coin_count`, `entry_usdt`, `exposure_limit_usdt`, `engine_enabled`.
+
+```ts
+// Pure: Avcı's second slot must be an UNCORRELATED basket (top of fleetExposureOk).
+// Reuses the beta-to-BTC basket idea; treats correlated majors as one position.
+export function avciCorrelationOk(avciSlots: FleetPos[], add: FleetPos): { ok: boolean; reason?: string } {
+  const basket = (p: FleetPos): "btc-l1" | "other" =>
+    p.betaToBtc >= 0.7 ? "btc-l1" : "other";                 // correlated BTC/ETH/L1 majors => one basket
+  const clash = avciSlots.some((p) => basket(p) === basket(add));
+  return clash ? { ok: false, reason: "avci_correlation_basket" } : { ok: true };
+}
+
+// Pure: regime STANDDOWN zeroes ONLY Avcı's coin_count; other roles untouched.
+export function avciEffectiveCoinCount(
+  base: number, regime: "ALLOW" | "REDUCE" | "STANDDOWN", standdownCoinCount = 0,
+): number {
+  if (regime === "STANDDOWN") return standdownCoinCount;      // 0 => Avcı opens nothing
+  if (regime === "REDUCE") return Math.min(base, 1);          // CAUTION => 1 slot
+  return base;                                                // ALLOW => coin_count 2
+}
+```
+
 ## References
 - [Bybit V5 — Get Position Info](https://bybit-exchange.github.io/docs/v5/position) — `/v5/position/list` size/side/avgPrice, the source of truth for computing fleet exposure.
 - [Bybit V5 — Place Order](https://bybit-exchange.github.io/docs/v5/order/create-order) — the single engine order path every role shares (`category:"linear"`).
@@ -182,3 +212,5 @@ async function releaseSymbolLock(db: DrizzleDb, symbol: string, botId: string) {
 - [Optimising crypto portfolios via correlation-network clustering (arXiv)](https://arxiv.org/html/2505.24831v1) — grouping correlated assets into baskets for exposure control.
 - [Bun — Documentation](https://bun.com/docs) — runtime for the engine, `bun test` for the pure fleet functions.
 - [Zod — Defining schemas](https://zod.dev/api) — validate role configs and candidate rows at the tRPC boundary.
+- [Momentum Crashes — Daniel & Moskowitz (NBER w20439, PDF)](https://www.nber.org/system/files/working_papers/w20439/w20439.pdf) — why Avcı's 2 correlated slots gap together in a crash and STANDDOWN zeroes its coin_count (see `avci-regime-timing-standdown`).
+- [Time-Series and Cross-Sectional Momentum in Crypto under Realistic Assumptions (Han/Kang/Ryu, SSRN)](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4675565) — top-quintile RS longs in a BTC-up regime behave as ~one beta-to-BTC bet, motivating the Avcı correlation cap.

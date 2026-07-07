@@ -37,7 +37,7 @@ Antigravity, **Agent Skills açık standardını** kullanır (Claude Code ile ay
 - Agent Skills in Antigravity — https://antigravity.google/docs/skills
 - Authoring Antigravity Skills (Codelab) — https://codelabs.developers.google.com/getting-started-with-antigravity-skills
 
-## 3. Katalog (32 skill / 9 grup)
+## 3. Katalog (38 skill / 10 grup)
 
 | Grup | Skill'ler |
 |---|---|
@@ -50,6 +50,7 @@ Antigravity, **Agent Skills açık standardını** kullanır (Claude Code ile ay
 | F · Güvenlik/İzleme/Test | `trading-app-security`, `monitoring-observability`, `testing-paper-trading` |
 | G · DevOps & AI | `deployment-devops-ha`, `parameter-optimizer`, `sentiment-news-signals`, `gemini-ai-integration` |
 | **H · SkyPower V3 (strateji)** | `coin-universe-selection`, `regime-detection`, `maker-execution-cost-control`, `atr-adaptive-exits`, `entry-guards-cooldown`, `fleet-coordination`, `strategy-validation-protocol`, `market-neutral-funding` |
+| **I · 🎯 Avcı (momentum rolü)** | `avci-breakout-confluence`, `avci-volume-volatility-confirmation`, `avci-volatility-position-sizing`, `avci-taker-entry-slippage-guard`, `avci-regime-timing-standdown`, `avci-signal-validation-rollout` |
 
 **v1 → v2 değişimleri:** dil Python→TypeScript/Bun · borsa örnekleri **yalnız Bybit** · WebSocket
 kaldırıldı → `rest-polling-and-rate-limits` · TimescaleDB → `mysql-drizzle-data-layer` · `event-bus-messaging`
@@ -77,6 +78,46 @@ taker 0.055 + Tier slippage + funding, DSR) · `strategy-development` (breakout/
 piramit ≤0.7) · `parameter-optimizer` (canlı döngü kapalı, offline walk-forward'a çerçevelendi).
 
 **İnşa sırası:** Faz A (Kayıkçı'yı canlıya taşıyan çekirdek) → Faz B (filo & kanıt) → Faz C (Safra, motor değişikliği).
+
+## 3c. 🎯 Avcı (Hunter) momentum rolüne özel derinleştirme (grup I)
+
+10 ajanlık bir **araştırma workflow'u** (8 paralel cephe + skeptik kritik + sentez, **81 doğrulanmış kaynak**)
+ile Avcı momentum/breakout rolü derinlemesine incelendi. 6 yeni beceri + 5 avci-profile güncelleme yazıldı.
+
+**Kritik ajanının merkezî uyarısı (tüm tasarımı yönetti):** **%34 kazanma oranı breakout sistemleri için
+NORMALDİR** — para pozitif çarpıklıktan gelir (birkaç büyük kazanan çok sayıda küçük kaybedeni öder). Filtre
+yığıp bu oranı yükseltmek sağ kuyruğu budar; asıl kaldıraçlar **payoff oranı (avg_win/avg_loss)** ve **ince
+Tier-B coinlerde çıkış slippage'i**dir (hiç ölçülmemiş). Bu yüzden **Gate-0**: inşadan önce L1 %34'ün payoff'unu
+ayrıştır (34%'te başabaş ≈1.94R); sağlıklıysa suçlu muhtemelen sıkı 0.8% trailing çıkıştır, sinyal değil.
+
+**v1 ilk-gönder üçlüsü** (kanıtı en güçlü): vol-ölçekli boyutlama + kapalı-bar anti-wick giriş + hacim/volatilite
+çift teyidi. MTF, relative-strength, MACD/RSI, ORB → flag arkasında, OOS'ta hak edene kadar kapalı. ~18 yeni
+anahtar muhafazakâr varsayılan + yalnız offline sweep (`optimizer_enabled: 0`).
+
+**6 yeni:** `avci-breakout-confluence` (Donchian+ADX+ROC+RVOL sert kapı) · `avci-volume-volatility-confirmation`
+(anti-fakeout) · `avci-volatility-position-sizing` (Barroso/Daniel-Moskowitz vol-target, ilk gönder) ·
+`avci-taker-entry-slippage-guard` (taker istisnası + çıkış-slippage) · `avci-regime-timing-standdown`
+(momentum-crash veto) · `avci-signal-validation-rollout` (Gate-0 + kademeli açılım).
+**5 güncelleme (avci-profile):** `strategy-development`, `atr-adaptive-exits` (0.8% callback→Chandelier),
+`fleet-coordination` (2-slot korelasyon kapağı), `entry-guards-cooldown`, `backtesting-engine`
+(avg_win/avg_loss/expectancy/payoff birinci-sınıf çıktı).
+
+**Avcı kaynakçası (81 doğrulanmış · seçki):**
+- **Sinyal/indikatör:** Donchian (LuxAlgo), ADX/ROC/RVOL (StockCharts), Turtle System, MTF (QuantPedia) — https://www.tradingblox.com/Manuals/UsersGuideHTML/turtlesystem.htm · https://chartschool.stockcharts.com/table-of-contents/technical-indicators-and-overlays/technical-indicators/average-directional-index-adx
+- **Anti-fakeout/squeeze:** TTM Squeeze (StockCharts), BB/KC (TrendSpider), False-breakout (FXNX/LuxAlgo) — https://chartschool.stockcharts.com/table-of-contents/technical-indicators-and-overlays/technical-indicators/ttm-squeeze · https://fxnx.com/en/blog/7-ways-avoid-false-breakouts-stop-being-market-liquidity
+- **Momentum-crash & vol-target:** Daniel-Moskowitz (NBER w20439), Barroso-Santa-Clara (SSRN 2041429), Man Group, Alpha Architect — https://www.nber.org/system/files/working_papers/w20439/w20439.pdf · https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2041429 · https://www.man.com/insights/the-impact-of-volatility-targeting
+- **Kripto momentum:** Han/Kang/Ryu (SSRN 4675565), BTC intraday (Reading), tea-time (Springer) — https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4675565
+- **Yürütme/mikroyapı:** Bybit create-order/slippageTolerance, Chase Order, Make-or-Take LOB (arXiv 2502.18625), Maker-vs-Taker (BloFin) — https://bybit-exchange.github.io/docs/v5/order/create-order · https://arxiv.org/html/2502.18625v1
+- **Boyutlama/piramit:** Pyramiding (QuantStrategy), Anti-Martingale (FXOpen), Turtle sizing (QuantifiedStrategies) — https://quantstrategy.io/blog/the-mathematics-of-pyramiding-calculating-position-sizes/
+- **Çıkış:** Chandelier (StockCharts), Bybit Trailing Stop — https://chartschool.stockcharts.com/table-of-contents/technical-indicators-and-overlays/technical-overlays/chandelier-exit · https://bybit-exchange.github.io/docs/v5/position/trading-stop
+- **Doğrulama:** Deflated Sharpe (Bailey-LdP SSRN 2460551), Walk-forward, Win-rate vs R:R (LuxAlgo) — https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2460551 · https://en.wikipedia.org/wiki/Walk_forward_optimization
+- ⚠️ Doğrulanacak: arXiv `2605.04004` (%80.7 stop-out) ve `2503.08692` (pump-dump) — ID desenleri cutoff'a yakın; dayanak yapılmadan teyit edilmeli.
+
+**Açık sorular (bloklayıcı dahil):** L1 %34'ün payoff'u (Gate-0); `profit_add_step_pct`/`layer_trigger_type`
+ve ~18 yeni anahtarın birimi; kline turnover(USDT) vs volume(base); MTF+OI+funding taramasının rate-limit
+bütçesine sığması; 2-slot korelasyon/beta veri kaynağı.
+
+**Paylaşılabilir rapor (artifact):** https://claude.ai/code/artifact/dd0bf88e-835e-4d3d-80b3-4c10c30c70b0
 
 ## 4. Metodoloji
 

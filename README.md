@@ -2,8 +2,8 @@
 
 > **TR:** **TypeScript/Bun** ile yazılmış, **MySQL** destekli, **polling** tabanlı, **Bybit** üzerinde
 > çalışan çok-döngülü bir **çoklu-bot kripto trading platformu** geliştiren bir yapay zeka aracının
-> (**Google Antigravity**) kullanacağı **Agent Skills** kataloğu. **32 skill / 9 grup** —
-> 8'i **SkyPower V3 Faz 3 filo stratejisine** özel. Türkçe özet + kaynakça → [`RESEARCH.md`](RESEARCH.md).
+> (**Google Antigravity**) kullanacağı **Agent Skills** kataloğu. **38 skill / 10 grup** — 8'i
+> **SkyPower V3 filo stratejisine**, 6'sı **🎯 Avcı momentum rolüne** özel. Türkçe özet + kaynakça → [`RESEARCH.md`](RESEARCH.md).
 
 A catalog of **Agent Skills** (`SKILL.md`) that give an AI coding agent the domain expertise to build
 and maintain **this specific** multi-bot crypto trading platform. Targets **Google Antigravity** (open
@@ -45,7 +45,7 @@ micro-pilot → kill-criteria). Real `v3_coin_config` keys are used throughout.
 - Each `SKILL.md` has a trigger-packed `description`; the agent loads a skill when the task matches.
   See [`AGENTS.md`](AGENTS.md) for the role → skill mapping.
 
-## Catalog (32 skills)
+## Catalog (38 skills)
 
 ### ⌂ Architecture (read these first)
 | Skill | What it covers |
@@ -115,16 +115,33 @@ micro-pilot → kill-criteria). Real `v3_coin_config` keys are used throughout.
 | [`strategy-validation-protocol`](.agents/skills/strategy-validation-protocol/SKILL.md) | Per-role proof gate: cost-aware backtest → walk-forward → one-time hold-out → **Deflated Sharpe** (count trials) / PBO → pass bar (≥300 trades, PF≥1.3, +EV, 2 regimes) → mainnet micro-pilot → staged scale + −10% kill. |
 | [`market-neutral-funding`](.agents/skills/market-neutral-funding/SKILL.md) | Safra role (**last priority, engine change**): delta-neutral spot-long + perp-short funding carry, two-leg simultaneous fills + partial-fill unwind, funding-threshold entry/exit, weekly delta rebalancing, realistic 2026 net APY. |
 
+### I · 🎯 Avcı (Hunter) — momentum/breakout role skills
+> **Discipline (from the research critic):** a 34% win rate is *normal* for breakout systems (positive skew) —
+> the confluence exists to cut trade **count**, not raise win rate. Ship the v1 trio first
+> (`avci-volatility-position-sizing`, `avci-volume-volatility-confirmation`, closed-bar signal); everything
+> else stays behind flags until it earns its keep out-of-sample. **Gate-0:** decompose the L1 34% baseline's
+> payoff ratio *before* redesigning.
+
+| Skill | What it covers |
+|---|---|
+| [`avci-breakout-confluence`](.agents/skills/avci-breakout-confluence/SKILL.md) | Signal engine `evaluateAvciBreakout()`: Donchian(20) close-beyond + ATR buffer trigger; ADX≥25/ROC≥`min_momentum_pct`/RVOL≥`min_hacim_carpan` hard gate; MTF/RS/RSI/MACD as flagged boosters (v1 = the 4 core). Hosts shared indicator helpers. |
+| [`avci-volume-volatility-confirmation`](.agents/skills/avci-volume-volatility-confirmation/SKILL.md) | v1 ship-first anti-fakeout gate: ANDs RVOL surge (Bybit turnover, median denom) with squeeze→expansion (BB-in-KC / BandWidth-pct), closed bars, ATR expansion ≥1.25. |
+| [`avci-volatility-position-sizing`](.agents/skills/avci-volatility-position-sizing/SKILL.md) | **Ship first** (best-evidenced): vol-scaled sizing `qty=(risk%·budget)/(k·ATR%)` → fixed 0.5-1% risk; single-symbol ≤30% cap; BTC-basket correlation cap on the 2 slots; decreasing pyramid (≤0.7) only while ROC>0 & vol calm. |
+| [`avci-taker-entry-slippage-guard`](.agents/skills/avci-taker-entry-slippage-guard/SKILL.md) | Avcı's taker exception: fee gap is a red herring, **exit** slippage on thin Tier-B stop-outs is the lever & blow-up path. Entry-instant depth/spread re-poll, IOC slippage cap (adverse-selection caveat), per-Tier exit-slippage model. |
+| [`avci-regime-timing-standdown`](.agents/skills/avci-regime-timing-standdown/SKILL.md) | `regimeGate()` — vetoes the dead-cat-bounce breakout the RVOL/ATR gate wrongly passes (momentum crash); chop-block (Choppiness>61.8/ADX<20), 13-21 UTC session, funding+OI veto; maps regime→coin_count (standdown = 0). |
+| [`avci-signal-validation-rollout`](.agents/skills/avci-signal-validation-rollout/SKILL.md) | Safety spine: **Gate-0** baseline decomposition (avg_win/avg_loss/payoff ≈1.94R breakeven at 34%), v1-vs-staged flag ladder, sample-size reality (~5-20 trades/mo → months), −10% kill. |
+
 ## Repository layout
 
 ```
-.agents/skills/<skill-name>/SKILL.md   # 32 documentation-only Agent Skills (TypeScript/Bun/Bybit)
+.agents/skills/<skill-name>/SKILL.md   # 38 documentation-only Agent Skills (TypeScript/Bun/Bybit)
 AGENTS.md                              # AI agent roles -> which skills each owns
 README.md                              # this catalog index
 RESEARCH.md                            # Türkçe özet + methodology + full source bibliography
 ```
 
 ---
-*Every `SKILL.md` ends with a verified **References** section (~240 unique sources). Group H is aligned to the
-**SkyPower V3 — Faz 3** strategy report (`v3_coin_config` keys, Tier-A/B, maker/EV math, ATR/Chandelier,
-regime compass, DSR/kill-criteria). See [`RESEARCH.md`](RESEARCH.md) for the bibliography and Turkish summary.*
+*Every `SKILL.md` ends with a verified **References** section (~290 unique sources). Group H aligns to the
+**SkyPower V3 — Faz 3** fleet strategy; group I specializes the **🎯 Avcı momentum role** (Donchian/ADX/ROC/RVOL
+confluence, vol-scaled sizing, taker/slippage reality, momentum-crash standdown, Gate-0 validation) from an
+81-source deep-research pass with an adversarial critic. See [`RESEARCH.md`](RESEARCH.md) for the bibliography.*

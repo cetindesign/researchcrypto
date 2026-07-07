@@ -163,6 +163,58 @@ test("a future bar never changes a past decision", () => {
 });
 ```
 
+## Avcı profile (breakout role — judge it HONESTLY)
+The Avcı (Hunter) breakout role is the least-proven role and the loudest critic gap is *zero own-data evidence and win-rate obsession without a payoff ratio*. This profile makes the backtester able to feed **Gate-0** in `avci-signal-validation-rollout` and to price Avcı's real execution reality. Do not judge Avcı on win rate — a **34% win rate is normal/optimal** for a positive-skew breakout system.
+
+- **Report the payoff distribution as first-class outputs, not just win rate.** Every Avcı backtest MUST return `avgWin`, `avgLoss` (positive magnitude), `expectancy` (winRate·avgWin − lossRate·avgLoss), and `payoffRatio` (avgWin/avgLoss) — all **net of fees + slippage + funding**. These are exactly the numbers Gate-0 decomposes; a report that shows only win rate cannot tell whether L1 lost on signal quality, the tight 0.8% trailing exit clipping winners, or sizing.
+- **Taker on BOTH entry AND exit, with Tier slippage.** Avcı crosses the spread on the breakout entry *and* on the forced/stop exit. Charge **taker 0.055%** and a Tier slippage buffer on each side — **Tier-A 5–10 bps, Tier-B 20–50 bps** — never `slippage = 0`. The exit on a thin Tier-B stop-out during a liquidity sweep is the **primary blow-up path**: model exit slippage that can *exceed* the 1.5×ATR stop, so realized avg_loss comes out larger than the intended stop implies.
+- **Taker on every pyramid layer.** Avcı is the only role that pyramids (profit-only, `profit_layer_multiplier 0.7`, up to `profit_max_layers 3`, add on `profit_add_step_pct 1.0`). Each added layer pays taker + slippage again. Sum fees over base + layers, not just the base entry.
+- **8h funding on hours-held positions.** Avcı holds hours and crosses funding stamps (00:00/08:00/16:00 UTC). Apply funding per stamp per held layer. Combined with dual-side taker and per-layer taker, the honest **all-in round-trip is ~0.2–0.4%+, not 0.11%** — which flips several marginal setups to negative expectancy.
+- **Model the IOC-slippage-cap adverse selection.** Avcı's entry is a taker IOC-limit capped N bps from Ask1 (see `avci-taker-entry-slippage-guard`). On the fastest, best breaks the book inside the cap is swept, so the order **rejects** exactly when the trade is good and **fills** in calm chop/fakeouts. A backtest that assumes every signal fills at the cap overstates the edge: reject the fill when the simulated next-bar adverse move exceeds the cap, and count that as a *missed winner*, not a free skip.
+- **Honor the universe partition.** Backtest Avcı on **Tier-A + Tier-B** liquidity with the higher signal threshold — backtesting on Tier-A only, then trading Tier-B, invalidates the slippage buffer.
+
+```ts
+// Avcı payoff decomposition — the outputs Gate-0 needs (all figures already NET of costs).
+export interface AvciTrade { netPnl: number; layers: number; hoursHeld: number; tier: "A" | "B"; }
+
+export function avciReport(trades: AvciTrade[]) {
+  const wins = trades.filter(t => t.netPnl > 0);
+  const losses = trades.filter(t => t.netPnl <= 0);
+  const avgWin = wins.length ? wins.reduce((a, t) => a + t.netPnl, 0) / wins.length : 0;
+  const avgLoss = losses.length ? Math.abs(losses.reduce((a, t) => a + t.netPnl, 0) / losses.length) : 0;
+  const winRate = trades.length ? wins.length / trades.length : 0;
+  return {
+    trades: trades.length, winRate, avgWin, avgLoss,
+    payoffRatio: avgLoss ? avgWin / avgLoss : Infinity,      // the lever — report it, not just win rate
+    expectancy: winRate * avgWin - (1 - winRate) * avgLoss,  // feeds avci-signal-validation-rollout Gate-0
+  };
+}
+
+// All-in round-trip for a pyramided Avcı trade: taker on entry + each layer + exit, plus funding per stamp.
+export function avciRoundTripCost(
+  layers: number, notional: number, spread: number, tier: "A" | "B",
+  fundingStampsCrossed: number, avgFundingRate: number,
+) {
+  const taker = 0.00055;
+  const slipBps = SLIP_BPS[tier][1] / 10_000;                // worst end of the band when unsure
+  const perFill = taker + spread / 2 / notional + slipBps;   // fee + half-spread + tier slippage, per side
+  const fills = layers /* entries */ + 1 /* exit */;
+  const funding = fundingStampsCrossed * Math.abs(avgFundingRate);
+  return fills * perFill + funding;                           // ~0.2–0.4%+, not 0.11%
+}
+
+// IOC slippage-cap adverse selection: the best/fastest breaks REJECT; chop FILLS.
+export function iocFill(capBps: number, nextBarAdverseBps: number) {
+  return { filled: nextBarAdverseBps <= capBps, missedWinner: nextBarAdverseBps > capBps };
+}
+```
+
+Avcı-specific pitfalls to add to the checks above:
+- **Win-rate-only report.** Omitting avg_win/avg_loss/payoff makes the 34% baseline undecomposable — the single most important Gate-0 input.
+- **Free stop-outs.** Filling Avcı exits at the mid or the intended stop hides the Tier-B sweep slippage where the money actually dies.
+- **Single-fill pyramids.** Charging taker once for a 3-layer position understates cost by 2–3×.
+- **Costless IOC.** Assuming every capped IOC fills flatters the edge by keeping exactly the winners the cap would reject.
+
 ## References
 - [Bun — Test runner (`bun:test`)](https://bun.com/docs/test) — assertions and fixtures for deterministic backtest checks.
 - [Bun — Documentation](https://bun.com/docs) — running TS backtest scripts and packages under Bun.

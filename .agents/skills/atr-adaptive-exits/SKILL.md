@@ -31,6 +31,18 @@ description: The SkyPower V3 3-layer hybrid adaptive-exit stack for the Bybit v3
 
 **Post-exit cooldown.** After any stop-out / trail-out on a symbol, apply a cooldown before re-entry (normal 60min; a loss streak escalates to 24h). Prevents oscillation and revenge re-entries. Enforced by the entry guards, not by the exit code itself.
 
+## Avci profile (Hunter / momentum-breakout role)
+
+The Avci (Hunter) role trades hours-horizon momentum breakouts on Tier-A+B coins — a **positive-skew** system whose profit comes from a few big winners, not from win rate (34% is normal/optimal for breakouts). Two exit-side corrections apply specifically to Avci; both target the critic's biggest expectancy leaks. See avci-volatility-position-sizing (sizing that consumes the modeled slippage) and avci-taker-entry-slippage-guard (the slippage model itself).
+
+**1. Prefer Chandelier over the tight fixed trailing_callback_pct — it lets winners run.** Avci's configured `trailing_activation_pct 2` / `trailing_callback_pct 0.8` is **likely too tight for a positive-skew role**: on a 2-8% ATR% coin a 0.8% callback is often **smaller than one ATR bar-range**, so it whipsaws out of exactly the runners the strategy depends on — truncating the right tail and keeping expectancy negative even as win rate looks fine. Prefer the **Chandelier trailing** already in this skill (long = `HH(22) - 3*ATR(22)`): it **breathes with volatility and ratchets**, giving winners room while still cutting losers. Treat `trailing_callback_pct 0.8` as a flag to **validate, not trust** — and validate it against the **payoff ratio (avg_win/avg_loss) and expectancy, NOT win rate** (a tighter trail raises win rate while lowering expectancy; that is the trap). Decompose the L1 baseline before tuning it (gate zero — see avci-signal-validation-rollout).
+
+**2. Model Tier-B EXIT-stop slippage that can exceed the 1.5xATR cushion — and feed it to the disaster stop.** For Avci's thin Tier-B coins, a stop-market **during a liquidity sweep blows straight through the 1.5xATR software stop**, so the realized loss is materially larger than the nominal stop distance. This is the primary blow-up path. Pull the **per-Tier exit-slippage bps model** from avci-taker-entry-slippage-guard (`exitSlippageBps`, Tier-A 5-10 / Tier-B 20-50, doubled under sweep conditions) and use it twice:
+- **Disaster-stop distance:** widen the exchange-side disaster stop (~3xATR baseline) so that `softwareStopDist + modeledSweepSlippage` still leaves margin above maintenance — the disaster stop must sit beyond where a sweep would actually fill, not just beyond the software stop.
+- **Sizing:** feed the same slippage fraction into `effectiveStopFrac` (avci-volatility-position-sizing) so the dollar risk reflects the *real* stop-out loss, not the optimistic 1.5xATR. Otherwise "0.75% risk per trade" is really 1%+ on Tier-B.
+
+Everything else in this skill (Wilder ATR, ratchet, time-stop, regime-scaling, mark-price triggers, `stop_loss_order_id` persistence) applies to Avci unchanged.
+
 ## Codebase specifics (Bybit / Bun / this platform)
 
 **Pure core placement.** All exit math is **pure functions** in `packages/` (e.g. `packages/exits`): ATR(14/22) Wilder, rolling HH/LL, Chandelier stop, initial-stop distance, time-stop predicate, ATR-percentile / regime scaler. No `fetch`, no Drizzle, no `Date.now()` — the engine (dirty shell) fetches klines / position and *calls* these. Unit-test everything with `bun test`. **[KOD] gap:** the ATR-stop calculator + Chandelier trailing do not exist yet — the engine uses static `stop_loss_pct` / `trailing_callback_pct`; this skill is how you add them.

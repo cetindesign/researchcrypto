@@ -168,6 +168,19 @@ test("reentrancy marker vetoes a second entry", () => {
 });
 ```
 
+## Avcı profile (momentum/breakout role — extra ANDed guards)
+
+Avcı (Hunter) runs the SAME pure guard bundle as every role, but wires **additional ANDed vetoes** that only apply to a momentum/breakout hunter. They compose exactly like the existing guards — pure `(now, cfg, state) => { allow, reason }`, short-circuiting AND, first blocking reason wins — and they run in the entry stage before any order. Each has a dedicated Avcı skill that owns its math; this skill just wires the verdicts in.
+
+**Extra guards to AND for Avcı (in short-circuit order — cheapest/most decisive first):**
+- **Regime standdown / CAUTION-no-counter-trend** — from `avci-regime-timing-standdown`'s `regimeGate(state)`. If `decision === STANDDOWN` (momentum-crash / dead-cat-bounce regime), veto (`reason: "avci_regime_standdown"`); if `decision === REDUCE` and the setup is a counter-trend bounce (not aligned with the HTF trend), veto (`reason: "avci_caution_counter_trend"`). This is the single most important Avcı veto — it blocks the one trade the RVOL/ATR confluence gate wrongly PASSES.
+- **Chop block** — `Choppiness > 61.8` OR `ADX < 20` → veto (`reason: "avci_chop"`). Enforces the HIGH threshold by refusing no-trend chop where fakeouts + taker cost dominate.
+- **Session gate** — outside `session_utc_allow` (13–21 UTC) require the stricter off-hours RVOL bar (`session_offhours_hacim_carpan` 4–5 vs 3); 00:00–06:00 UTC is stricter still or a full stand-down (`reason: "avci_session"`).
+- **Funding-extreme + OI-not-confirming** — |funding| ≥ `funding_extreme_pct` (0.05–0.10) AND OI not rising → veto (`reason: "avci_funding_unconfirmed"`): a crowded, unsupported squeeze breakout, not a fresh trend.
+- **Liquidity-sweep / opposing-wick reject** — from `avci-volume-volatility-confirmation`: reject if the breakout bar is an intrabar sweep of the level that closed back inside, or has an opposing wick ≥ `opposing_wick_reject_pct` (50%) of its range (`reason: "avci_liquidity_sweep"`). Closed-bar, anti-wick discipline as a guard.
+
+**The reentrancy guard [KOD] is DOUBLY important for Avcı — because Avcı PYRAMIDS.** Every other role opens once per symbol, so a double-open is the only reentrancy failure. Avcı adds profit layers (`profit_layer_enabled: 1`, `profit_max_layers: 3`, `profit_layer_multiplier: 0.7`, add on `profit_add_step_pct: 1.0`), so under polling a **slow reconcile can double-add a single layer**: two ticks both see "price advanced +1%, add a layer" before the first add fills, and Avcı silently ends up with 2× the intended tranche and broken pyramid geometry. The in-flight marker MUST key on **symbol + intent + layer index** (not just symbol) so a pending *add* vetoes the next add attempt, and it MUST be set BEFORE the order and cleared only after reconcile confirms the fill. Pair it with `orderLinkId` idempotency (belt and suspenders) — an `orderLinkId` per `(symbol, layer)` means even if the marker is lost on crash, the exchange rejects the duplicate add. Consumes NEW keys: `chop_max` (61.8), `session_utc_allow` ('13-21'), `session_offhours_hacim_carpan` (4–5), `funding_extreme_pct` (0.05–0.10), `oi_confirm_enabled` (1), `sweep_window_bars` (3), `opposing_wick_reject_pct` (50), `regime_compass_enabled` (1). Like all Avcı gate keys these ship with conservative defaults, are swept only offline, and never live-optimize (`optimizer_enabled: 0`). As always: these guards veto ENTRY (open AND layer-add) only — never a close, stop, or reduce-only.
+
 ## References
 - [Bybit V5 — Get Position Info](https://bybit-exchange.github.io/docs/v5/position) — `/v5/position/list` to confirm fills and clear the reentrancy marker on reconcile.
 - [Bybit V5 — Get Open Orders](https://bybit-exchange.github.io/docs/v5/order/open-order) — query by `orderLinkId` to see if an in-flight entry already landed (complements the marker).
@@ -177,3 +190,5 @@ test("reentrancy marker vetoes a second entry", () => {
 - [Drizzle ORM — Transactions](https://orm.drizzle.team/docs/transactions) — atomically claim symbol-lock and set the in-flight marker so two ticks can't both open.
 - [Bun — Test runner](https://bun.com/docs/cli/test) — `bun test` for boundary tests on each guard predicate.
 - [Investopedia — Trading Cooldown / Overtrading discipline](https://www.investopedia.com/terms/o/overtrading.asp) — rationale for post-loss cooldowns to curb revenge/thrash entries.
+- [Momentum Crashes — Daniel & Moskowitz (NBER w20439, PDF)](https://www.nber.org/system/files/working_papers/w20439/w20439.pdf) — why the Avcı regime-standdown guard vetoes the dead-cat-bounce breakout (see `avci-regime-timing-standdown`).
+- [Stop Being the Liquidity: 7 False-Breakout Filters (FXNX)](https://fxnx.com/en/blog/7-ways-avoid-false-breakouts-stop-being-market-liquidity) — the liquidity-sweep / opposing-wick reject wired from `avci-volume-volatility-confirmation`.
