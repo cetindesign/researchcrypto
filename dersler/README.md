@@ -27,7 +27,7 @@ kararlarını **bilinçli ve güvenli** verebilmen için gereken temeli öğretm
 | 1 | [Temeller: Kaldıraç, Teminat, Long/Short](01-temeller.md) | ✅ |
 | 2 | [Likidasyon: Nasıl "yanarsın"](02-likidasyon.md) | ✅ |
 | 3 | [Perpetual Futures & Funding Rate](03-perpetual-ve-funding.md) | ✅ |
-| 4 | Emir Tipleri: Market, Limit, Stop-Loss, Take-Profit | 🔜 |
+| 4 | [Emir Tipleri: Market, Limit, Stop-Loss, Take-Profit](04-emir-tipleri.md) | ✅ |
 | 5 | Risk Yönetimi: Pozisyon büyüklüğü, işlem başına risk | 🔜 |
 | 6 | Pratik: Demo hesapta ilk işlem | 🔜 |
 | 7 | Psikoloji & sık yapılan ölümcül hatalar | 🔜 |
