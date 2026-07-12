@@ -28,7 +28,7 @@ kararlarını **bilinçli ve güvenli** verebilmen için gereken temeli öğretm
 | 2 | [Likidasyon: Nasıl "yanarsın"](02-likidasyon.md) | ✅ |
 | 3 | [Perpetual Futures & Funding Rate](03-perpetual-ve-funding.md) | ✅ |
 | 4 | [Emir Tipleri: Market, Limit, Stop-Loss, Take-Profit](04-emir-tipleri.md) | ✅ |
-| 5 | Risk Yönetimi: Pozisyon büyüklüğü, işlem başına risk | 🔜 |
+| 5 | [Risk Yönetimi: Pozisyon büyüklüğü, işlem başına risk](05-risk-yonetimi.md) | ✅ |
 | 6 | Pratik: Demo hesapta ilk işlem | 🔜 |
 | 7 | Psikoloji & sık yapılan ölümcül hatalar | 🔜 |
 
