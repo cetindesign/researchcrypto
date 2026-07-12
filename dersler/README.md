@@ -30,7 +30,7 @@ kararlarını **bilinçli ve güvenli** verebilmen için gereken temeli öğretm
 | 4 | [Emir Tipleri: Market, Limit, Stop-Loss, Take-Profit](04-emir-tipleri.md) | ✅ |
 | 5 | [Risk Yönetimi: Pozisyon büyüklüğü, işlem başına risk](05-risk-yonetimi.md) | ✅ |
 | 6 | [Pratik: Demo hesapta ilk işlem](06-pratik.md) | ✅ |
-| 7 | Psikoloji & sık yapılan ölümcül hatalar | 🔜 |
+| 7 | [Psikoloji & sık yapılan ölümcül hatalar](07-psikoloji-ve-hatalar.md) | ✅ |
 
 ---
 
@@ -39,3 +39,16 @@ kararlarını **bilinçli ve güvenli** verebilmen için gereken temeli öğretm
 - Dersleri sırayla oku, sonundaki kontrol sorularını **kendine** çöz.
 - Anlamadığın yerde dur, tekrar et. Acele etme — burada hız değil, **anlamak** önemli.
 - Hiçbir kavramı "geçtim say" deme; her biri gerçek parada bir hataya karşılık gelir.
+
+---
+
+## 🎓 Kursu bitirdikten sonra
+
+1. **Demo/testnet'te en az birkaç hafta** işlem yap; işlem günlüğü tut.
+2. Demo'da **tutarlı** (şans değil, kurallı) sonuç almadan gerçek paraya geçme.
+3. Gerçek paraya geçince **kaybetmeyi göze alabileceğin, küçük** bir miktarla başla.
+4. Kaldıracı düşük tut (2x-5x), işlem başına riski %1'de sabitle.
+5. Her işlemde: Isolated margin + stop-loss + take-profit + yazılı gerekçe.
+
+> Bu kurs eğitim amaçlıdır, **yatırım tavsiyesi değildir.** Kaldıraçlı işlem yüksek
+> risklidir ve bireysel yatırımcıların çoğu para kaybeder. Sorumluluk sana aittir.
