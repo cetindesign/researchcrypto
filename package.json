@@ -1,0 +1,11 @@
+{
+  "name": "crypto-meanrev-scanner",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Bybit + Bun mean-reversion tarayici: Bollinger %B + RSI + ADX/trend filtresi ve karar loglama",
+  "scripts": {
+    "scan": "bun scanner.ts",
+    "scan:json": "bun scanner.ts --json",
+    "selftest": "bun scanner.ts --selftest"
+  }
+}

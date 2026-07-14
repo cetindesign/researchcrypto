@@ -1,0 +1,4 @@
+node_modules/
+scanner-log.jsonl
+*.log
+.DS_Store
