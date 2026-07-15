@@ -83,6 +83,42 @@ güçlü → bonus). Bu, SOP K3'ün RS testini ön-eler.
 
 ---
 
+## 2b. 🔴 Piyasa-Yön Kapısı — "referanslı dinamik"in kalbi (14 Tem 2026 dersi)
+
+**Gerçek olay:** 14 Tem 2026'da soğuk enflasyon verisiyle piyasa geniş yükseldi
+(BTC +%3.8, ETH +%6.1, ADA +%25) ve bu bir **short squeeze**'di ($281M short tasfiye).
+Bot bu gün **zarar etti** — çünkü "downtrend coinleri → üst-bant SHORT" mantığıyla
+**yükselen bir piyasaya short'ladı** ve sıkıştı.
+
+**Ders:** Coin başına rejim yeterli değil. Seçim, **agregat piyasa yönüne** bağlanmalı;
+yoksa piyasa döndüğünde bot ters yönde ısrar eder. Eksik katman buydu.
+
+`computeMarketBias({ btcMomPct, breadthAboveMA, shortLiqShare })` → `risk_on / risk_off / neutral`:
+| Sinyal | risk_on (short'u kıs) | risk_off (long'u kıs) |
+|---|---|---|
+| BTC ~24s momentum | > +%2 | < −%2 |
+| Breadth (evrenin % kaçı kısa-MA üstünde) | > 0.60 | < 0.40 |
+| Tasfiye dengesi (short'ların payı) | > 0.60 (short'lar eziliyor = squeeze) | < 0.40 |
+
+`scoreCoin`, yönü piyasaya ters coinleri **sertçe kırpar** (gate, ağırlıklı bileşen değil):
+- `risk_on` + short → `×0.35` (yükselen piyasaya short = squeeze yemi)
+- `risk_off` + long → `×0.45`
+- **Anti-squeeze:** short + negatif funding (kalabalık short) `×0.6`; short + `%B ≤ 0.15` (dipte, oversold) `×0.6`
+- **Anti-chase:** long + `%B ≥ 0.85` (tepede) `×0.6`
+
+> Referans: `coin-scorer.ts` → `computeMarketBias()` + `scoreCoin` `marketAlign`.
+> Selftest: `DOWN(61, neutral) → DOWN(21, risk_on)`; 14 Tem tipi girdi `= risk_on`.
+
+**Neden bu, "sürekli sana sormak yerine dinamik" demek:** Piyasa durumu her turda yeniden
+ölçülür; koşullar değişince (ör. yukarı kırılım) sistem short beslemesini otomatik keser,
+long'a döner. Statik liste yerine **canlı piyasa-durumuna referanslı** bir kapı.
+
+**İlave koruma (bilinen eksik #4):** Bu gün gösterdi ki 10 korele short aynı anda squeeze
+olabilir. `selectUniverse` yön çeşitliliği (§3) + risk katmanında "aynı yönde maks N pozisyon"
+şart. Ayrıca bu tür macro-veri (CPI/enflasyon) günlerinde `event_lock_minutes` veya boyut-küçültme.
+
+---
+
 ## 3. Çeşitlilik / korelasyon filtresi (`selectUniverse`)
 
 Ham top-N genelde 15 birbiriyle korele alt-coinle dolar (hepsi BTC ile aynı anda hareket eder).

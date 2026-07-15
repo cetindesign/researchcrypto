@@ -55,6 +55,7 @@ export type ScoreInput = {
   volSurge?: number;         // son 5m hacim / 20-mum ort (orn 1.4)
   isBlacklisted?: boolean;
   isNonCrypto?: boolean;     // XAU/XAUT vb.
+  marketBias?: "risk_on" | "risk_off" | "neutral"; // canli piyasa-yon kapisi (computeMarketBias)
 };
 
 export type ScoreResult = {
@@ -192,16 +193,47 @@ export function scoreCoin(inp: ScoreInput, cfg = SCORE_CFG): ScoreResult {
   if (inp.fundingRate !== undefined && direction === "long" && inp.fundingRate > cfg.fundingCapAbs) funding = 0.4;
   if (inp.fundingRate !== undefined && direction === "short" && inp.fundingRate < -cfg.fundingCapAbs) funding = 0.4;
 
-  const components = { liquidity, regimeFit, volatility, sopProxy, funding };
+  // 6) PİYASA-YÖN KAPISI + ANTI-SQUEEZE (14 Tem 2026 dersi: ralli piyasada short'lama)
+  // Bu bir GATE'tir, agirlikli bilesen degil: yon piyasaya ters ise skoru sertce kirpar.
+  let marketAlign = 1;
+  const mb = inp.marketBias ?? "neutral";
+  if (direction === "short") {
+    if (mb === "risk_on") marketAlign = 0.35;            // yukselen piyasaya short = squeeze yemi
+    // anti-squeeze: kalabalik short (negatif funding) VEYA dipte short (oversold-at-support)
+    if (inp.fundingRate !== undefined && inp.fundingRate < -cfg.fundingCapAbs) marketAlign *= 0.6;
+    if (pctB <= 0.15) marketAlign *= 0.6;
+  } else if (direction === "long") {
+    if (mb === "risk_off") marketAlign = 0.45;           // dusen piyasaya long
+    if (pctB >= 0.85) marketAlign *= 0.6;                // tepede long
+  }
+
+  const components = { liquidity, regimeFit, volatility, sopProxy, funding, marketAlign };
   const raw =
     cfg.w.liquidity * liquidity + cfg.w.regimeFit * regimeFit + cfg.w.volatility * volatility +
     cfg.w.sopProxy * sopProxy + cfg.w.funding * funding;
-  const score = Math.round(raw * 100);
+  const score = Math.round(raw * 100 * marketAlign);
 
   return {
     symbol: inp.symbol, gatePassed: true, score, botFit, direction, regime, components,
-    reason: `${regime}/${botFit} dir=${direction} Hurst=${hurstV.toFixed(2)} ATR%=${Number.isFinite(atr) ? atr.toFixed(2) : "-"} %B=${pctB.toFixed(2)}`,
+    reason: `${regime}/${botFit} dir=${direction} bias=${mb} align=${marketAlign.toFixed(2)} Hurst=${hurstV.toFixed(2)} ATR%=${Number.isFinite(atr) ? atr.toFixed(2) : "-"} %B=${pctB.toFixed(2)}`,
   };
+}
+
+/**
+ * Canlı piyasa-yön (breadth) sinyali → yön kapısı.
+ * 14 Tem 2026 dersi: bot yükselen piyasada short'layıp squeeze yedi. Bu fonksiyon
+ * agregat piyasa durumundan "risk_on/off/neutral" üretir; scoreCoin short/long
+ * skorlarını buna göre kırpar.
+ *   btcMomPct       : BTC son ~24s % değişim
+ *   breadthAboveMA  : evrenin yüzde kaçı kısa-MA üstünde (0..1)
+ *   shortLiqShare   : son tasfiyelerin short oranı (0..1); >0.6 = short'lar eziliyor = squeeze
+ */
+export function computeMarketBias(x: { btcMomPct: number; breadthAboveMA: number; shortLiqShare?: number }): "risk_on" | "risk_off" | "neutral" {
+  let s = 0;
+  if (x.btcMomPct > 2) s++; else if (x.btcMomPct < -2) s--;
+  if (x.breadthAboveMA > 0.6) s++; else if (x.breadthAboveMA < 0.4) s--;
+  if (x.shortLiqShare !== undefined) { if (x.shortLiqShare > 0.6) s++; else if (x.shortLiqShare < 0.4) s--; }
+  return s >= 1 ? "risk_on" : s <= -1 ? "risk_off" : "neutral";
 }
 
 /**
@@ -246,6 +278,7 @@ function selftest() {
     ["DOWN→MR_SHORT", mk("DOWNUSDT", "down")],
     ["UP→MR_LONG", mk("UPUSDT", "up")],
     ["CHAOS→CHAOS", mk("CHAOSUSDT", "chaos")],
+    ["DOWN + risk_on → short baskilanir", mk("DOWNONUSDT", "down", { marketBias: "risk_on" })],
     ["dusuk-hacim→AVOID(gate)", mk("SMALLUSDT", "range", { vol24hUsd: 10e6 })],
     ["altin→AVOID", mk("XAUTUSDT", "range", { isNonCrypto: true })],
   ];
@@ -268,6 +301,8 @@ function selftest() {
     ["CHAOS → chaos rejim", by["CHAOSUSDT"].regime === "chaos"],
     ["dusuk hacim gate ELEDI", !by["SMALLUSDT"].gatePassed],
     ["altin AVOID (gate)", !by["XAUTUSDT"].gatePassed],
+    ["risk_on SHORT'u baskiliyor (DOWNON < DOWN)", by["DOWNONUSDT"].score < by["DOWNUSDT"].score],
+    ["computeMarketBias(14 Tem tipi) = risk_on", computeMarketBias({ btcMomPct: 3.8, breadthAboveMA: 0.7, shortLiqShare: 0.8 }) === "risk_on"],
     ["secilen evren AVOID icermez", uni.every((r) => r.botFit !== "AVOID")],
     ["tum gecen skorlar 0-100", results.filter((r) => r.gatePassed).every((r) => r.score >= 0 && r.score <= 100)],
   ];
