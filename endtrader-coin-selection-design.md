@@ -130,12 +130,18 @@ limiti yok). Çözüm: sıralı listeden seçerken **aynı yönde en fazla `maxP
 
 ## 3b. Adaptif çekirdek: giriş-anı kapısından SÜREKLİ yeniden-gerekçelendirmeye
 
-**Prensip:** Sistem "tek yönde takılıyor" çünkü tüm kapıları **giriş anında** çalışıyor;
-pozisyon açıldıktan sonra hiçbir şey onu güncel koşullara karşı yeniden sorgulamıyor.
-Adaptiflik = aynı yön/rejim/piyasa mantığını **her turda açık kitaba da** uygulamak.
+**Prensip (motor incelemesiyle düzeltildi, `0b27f4c`):** Motorda pozisyon çıkışları **var** —
+Trend için karşıt-EMA (tez-bozulma) çıkışı, herkeste aktif momentum + stale süpürgesi, ROE stopu
+ve günlük-kilit tasfiyesi. Her pozisyonun bir stopu ve çıkışı var; "geri çeken hiçbir kuvvet yok"
+demek **yanlış olur.** Gerçek sınır dar ve nokta atışı: **giriş-anı doğrulama katmanı (SOP 3-katman,
+yön kapıları, haber) açık pozisyona hiç yeniden koşmuyor** ve çıkışlar giriş-anındaki `p.strategy`'ye
+donuyor. Üç somut boşluk:
+1. **Rejim değişince** açık pozisyon yeniden değerlendirilmiyor.
+2. **MR için karşıt-tez çıkışı yok** (Trend'de var — karşıt-EMA).
+3. **Haber yön kısıtı** yalnız girişte; mevcut pozisyonlara işlemiyor.
 
-Motorun durumu (commit `0b27f4c`): işlem-bazında yön kapıları **var** (K1 EMA, OI-uyumu,
-RS, haber). Portföy-bazında yön/korelasyon limiti **yok** (§10.2). İki eksik → `portfolio-guard.ts`:
+İşlem-bazında yön kapıları **var** (K1 EMA, OI-uyumu, RS, haber). Portföy-bazında yön/korelasyon
+limiti **yok** (§10.2). İki katman → `portfolio-guard.ts`:
 
 **(1) `exposureGuard()` — giriş anı, portföy maruziyeti** (portföy ısısının yanında çalışır):
 - **Aynı yönde maks N** — senin bulduğun tek-satır MVP.
@@ -144,10 +150,15 @@ RS, haber). Portföy-bazında yön/korelasyon limiti **yok** (§10.2). İki eksi
   ısısı görmez. Net'i **azaltan** (hedge) ters-yön işlemi engellenmez.
 - **Korelasyon-küme net tavanı** `%40` — granülerlik (L1 / DeFi / L2 / meme / major …).
 
-**(2) `reviewOpenPositions()` — her tur, açık-kitap yeniden-gerekçe** (stale/trailing çıkışlarına EK):
-- Piyasa-yönü bir pozisyonun yönüne sert ters döndüyse (`risk_on↔short`, `risk_off↔long`)
-  → **küçült/kapat.** 14 Tem zararı **açık** short'lardan geldi; "yeni giriş açma" tek başına
-  yetmez, mevcut kitabı da yönetmek şart.
+**(2) `reviewOpenPositions()` — her tur, açık-kitap yeniden-gerekçe** (mevcut çıkışlara EK, yerine değil):
+Yukarıdaki üç boşluğu tek yerde kapatır — `marketBias` ters dönüşü (#1), `thesisFlipped` (#2, MR
+karşıt-tez: fade edilen band/rejim kırıldı), `adverseNews` (#3). Tetiklenirse reduce/close önerir.
+
+> **Öncelik notu (14 Tem):** Her short'un zaten ROE stopu vardı; o gün zarar esas olarak
+> **korele short'ların aynı anda stoplanması** (portföy körlüğü) + **dönüşe short açılması**
+> (giriş kapısı eksikliği) idi — "açık pozisyon hiç yönetilmiyordu" değil. Bu yüzden asıl kaldıraç
+> **giriş tarafında**: market-bias gate + net-maruziyet. `reviewOpenPositions` ikincil ama gerçek
+> katman (üç boşluğu kapatır, stop'tan önce ters-dönende çıkışı hızlandırır).
 
 > Referans `portfolio-guard.ts` selftest 5/5: 3. aynı-yön long bloklanır · net-azaltan short
 > izin alır · net %70 > %60 bloklanır · `risk_on`'da 2 açık short → reduce.

@@ -42,7 +42,11 @@ export function clusterOf(symbol: string): string {
 
 // ------------------------------- TYPES --------------------------------
 export type Side = "long" | "short";
-export type OpenPosition = { symbol: string; side: Side; notionalUsd: number };
+export type OpenPosition = {
+  symbol: string; side: Side; notionalUsd: number;
+  thesisFlipped?: boolean;  // boşluk #2: MR karşıt-tez (fiyat fade edilen bandı kırdı / coin rejimi döndü)
+  adverseNews?: boolean;    // boşluk #3: aleyhte haber (motor bunu açık pozisyona uygulamıyor)
+};
 export type Candidate = { symbol: string; side: Side; notionalUsd: number };
 export type MarketBias = "risk_on" | "risk_off" | "neutral";
 
@@ -85,21 +89,28 @@ export function exposureGuard(
 
 // ----------------------- OPEN-BOOK RE-JUSTIFY -------------------------
 /**
- * Her turda açık pozisyonları güncel piyasa-yönüne karşı yeniden gerekçelendir.
- * Piyasa bir pozisyonun yönüne SERT ters döndüyse (risk_on↔short, risk_off↔long)
- * → küçült/kapat. Bu, "sadece yeni giriş açma"nın ötesinde açık kitabı da yönetir.
- * (Native SL/TP, stale ve trailing çıkışları BUNUN YERİNE geçmez — bunlara EK'tir.)
+ * Her turda açık pozisyonları güncel koşullara karşı yeniden gerekçelendir.
+ * Motorun MEVCUT çıkışlarına (Trend karşıt-EMA, momentum, stale, ROE stop, günlük kilit)
+ * BİR YEDEK DEĞİL — onların KAPSAMADIĞI üç boşluğu doldurur (kullanıcı motor incelemesi, 0b27f4c):
+ *   #1 rejim değişince açık pozisyonun yeniden değerlendirilmemesi → marketBias ters dönüşü
+ *   #2 MR için karşıt-tez çıkışının olmaması (Trend'de var)        → p.thesisFlipped
+ *   #3 haber yön kısıtının açık pozisyona işlememesi              → p.adverseNews
+ * Tetiklenirse reduce/close önerir; motordaki stop yine de her pozisyonu bağlar.
  */
 export function reviewOpenPositions(
   open: OpenPosition[], marketBias: MarketBias, cfg = GUARD_CFG,
 ): Array<{ symbol: string; side: Side; action: "hold" | "reduce" | "close"; reason: string }> {
   return open.map((p) => {
-    const against =
+    const marketAgainst =
       (marketBias === "risk_on" && p.side === "short") ||
       (marketBias === "risk_off" && p.side === "long");
-    if (against)
-      return { symbol: p.symbol, side: p.side, action: cfg.reviewAction, reason: `piyasa ${marketBias} → ${p.side} tezi bozuldu` };
-    return { symbol: p.symbol, side: p.side, action: "hold", reason: `piyasa ${marketBias} ile uyumlu` };
+    const reasons: string[] = [];
+    if (marketAgainst) reasons.push(`piyasa ${marketBias}`);         // #1
+    if (p.thesisFlipped) reasons.push("karsit-tez (band/rejim kirildi)"); // #2
+    if (p.adverseNews) reasons.push("aleyhte haber");                // #3
+    if (reasons.length)
+      return { symbol: p.symbol, side: p.side, action: cfg.reviewAction, reason: `${p.side} tezi bozuldu: ${reasons.join(" + ")}` };
+    return { symbol: p.symbol, side: p.side, action: "hold", reason: "tez gecerli" };
   });
 }
 
@@ -128,16 +139,27 @@ function selftest() {
   // Senaryo C: net maruziyet tavani ($700 long / $1000 = %70 > %60)
   const c = exposureGuard([P("BTCUSDT", "long", 400)], { symbol: "ETHUSDT", side: "long", notionalUsd: 300 }, eq, { ...GUARD_CFG, maxSameSide: 5 });
 
-  // Senaryo D: 14 Tem — 2 acik SHORT, piyasa risk_on → ikisi de kucult/kapat
+  // Senaryo D: 14 Tem — 2 acik SHORT, piyasa risk_on → ikisi de kucult/kapat (bosluk #1)
   const openD = [P("AVAXUSDT", "short", 200), P("ADAUSDT", "short", 200)];
   const d = reviewOpenPositions(openD, "risk_on");
+
+  // Senaryo E: NOTR piyasa ama MR karsit-tez (#2) ve aleyhte haber (#3) → yine kucult
+  const openE: OpenPosition[] = [
+    { symbol: "LTCUSDT", side: "short", notionalUsd: 200, thesisFlipped: true },
+    { symbol: "SOLUSDT", side: "long", notionalUsd: 200, adverseNews: true },
+    { symbol: "BTCUSDT", side: "long", notionalUsd: 200 },
+  ];
+  const e = reviewOpenPositions(openE, "neutral");
+  const eBy: Record<string, string> = {}; e.forEach((x) => (eBy[x.symbol] = x.action));
 
   const rows: [string, boolean, string][] = [
     ["A: 3. ayni-yon long BLOKLANIR", !a.allow, a.reason],
     ["B: net'i azaltan short IZIN alir", b.allow, b.reason],
     ["C: net maruziyet %70 > %60 BLOKLANIR", !c.allow, c.reason],
-    ["D: risk_on'da 2 short da 'reduce/close'", d.every((x) => x.action !== "hold"), d.map((x) => `${x.symbol.replace("USDT", "")}:${x.action}`).join(",")],
-    ["D: aksiyon reduce (varsayilan)", d.every((x) => x.action === "reduce"), ""],
+    ["D: risk_on'da 2 short da 'reduce/close' (#1)", d.every((x) => x.action !== "hold"), d.map((x) => `${x.symbol.replace("USDT", "")}:${x.action}`).join(",")],
+    ["E: karsit-tez short kucultulur (#2)", eBy["LTCUSDT"] !== "hold", "LTC:" + eBy["LTCUSDT"]],
+    ["E: aleyhte-haber long kucultulur (#3)", eBy["SOLUSDT"] !== "hold", "SOL:" + eBy["SOLUSDT"]],
+    ["E: temiz pozisyon TUTULUR", eBy["BTCUSDT"] === "hold", "BTC:" + eBy["BTCUSDT"]],
   ];
   console.log("  " + "─".repeat(92));
   let ok = true;
