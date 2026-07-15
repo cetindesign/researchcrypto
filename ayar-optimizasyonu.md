@@ -26,7 +26,11 @@ kaliteyi geri yükler, ama **hiçbir ayar negatif bir ham edge'i pozitife çevir
 ## B. Sinyal kalitesi — %13 win'in kök nedeni (Katman-2'yi geri aç)
 
 14 Tem'de her girişte **"MSS Bypass + Divergence Bypass + RS Kapalı"** vardı = Katman-2 fiilen
-devre dışı → çöp sinyaller. Geri sıkılaştır (ama %100 katıya değil, o 0-işlem veriyordu):
+devre dışı → çöp sinyaller. Geri sıkılaştır (ama %100 katıya değil, o 0-işlem veriyordu).
+
+> **Not (double-check):** Bu kolonların **doküman varsayılanı "açık"tır**; canlıda bilinçli
+> kapatılmış (gevşetme). Yani öneri "kapalı→açık" değil, **gevşetmeyi geri almak** — panelden
+> canlı değerleri teyit et.
 
 | Kolon | Şimdi | Öneri | Neden |
 |---|---|---|---|
@@ -56,7 +60,7 @@ devre dışı → çöp sinyaller. Geri sıkılaştır (ama %100 katıya değil,
 | `leverage` | 10 | **5** | İşlem başı salınımı yarıya indirir; edge belirsizken sermaye korunur. |
 | `daily_loss_limit_pct` | 2 | **1.5** | Günlük zarar backstop'unu sıkılaştır (14 Tem −%3.2 idi). |
 | Risk-kilidi bypass | — | **KULLANMA** | 14 Tem: 19:25 kilit tetiklendi → bypass → 4 yeni giriş, **4'ü de zarar (−$18)**. Kilit tam bunu engelliyordu. `risk_lock_bypass_at`'i o gün için set etme. |
-| `consecutive_loss_limit` | 2 | 2 (aynı) | Çalıştı; dokunma. |
+| `consecutive_loss_limit` | ? (varsayılan 2) | **2-3** (teyit et) | Kilit ~5 stoptan sonra tetiklendi → canlı değer varsayılandan yüksek olabilir. Daha erken ısırsın diye 2-3; önce canlı değeri doğrula. |
 
 ---
 
