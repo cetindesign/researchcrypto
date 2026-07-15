@@ -128,6 +128,40 @@ limiti yok). Çözüm: sıralı listeden seçerken **aynı yönde en fazla `maxP
 
 ---
 
+## 3b. Adaptif çekirdek: giriş-anı kapısından SÜREKLİ yeniden-gerekçelendirmeye
+
+**Prensip:** Sistem "tek yönde takılıyor" çünkü tüm kapıları **giriş anında** çalışıyor;
+pozisyon açıldıktan sonra hiçbir şey onu güncel koşullara karşı yeniden sorgulamıyor.
+Adaptiflik = aynı yön/rejim/piyasa mantığını **her turda açık kitaba da** uygulamak.
+
+Motorun durumu (commit `0b27f4c`): işlem-bazında yön kapıları **var** (K1 EMA, OI-uyumu,
+RS, haber). Portföy-bazında yön/korelasyon limiti **yok** (§10.2). İki eksik → `portfolio-guard.ts`:
+
+**(1) `exposureGuard()` — giriş anı, portföy maruziyeti** (portföy ısısının yanında çalışır):
+- **Aynı yönde maks N** — senin bulduğun tek-satır MVP.
+- **Net maruziyet** `|Σlong − Σshort| / equity ≤ %60` — asıl koruma. Alt'lar ~hepsi BTC-beta
+  olduğu için 3 "farklı" long = tek kaldıraçlı BTC-long; net-maruziyet bunu görür, portföy
+  ısısı görmez. Net'i **azaltan** (hedge) ters-yön işlemi engellenmez.
+- **Korelasyon-küme net tavanı** `%40` — granülerlik (L1 / DeFi / L2 / meme / major …).
+
+**(2) `reviewOpenPositions()` — her tur, açık-kitap yeniden-gerekçe** (stale/trailing çıkışlarına EK):
+- Piyasa-yönü bir pozisyonun yönüne sert ters döndüyse (`risk_on↔short`, `risk_off↔long`)
+  → **küçült/kapat.** 14 Tem zararı **açık** short'lardan geldi; "yeni giriş açma" tek başına
+  yetmez, mevcut kitabı da yönetmek şart.
+
+> Referans `portfolio-guard.ts` selftest 5/5: 3. aynı-yön long bloklanır · net-azaltan short
+> izin alır · net %70 > %60 bloklanır · `risk_on`'da 2 açık short → reduce.
+
+**"Tek yerde takılmama"nın 4 döngüsü (yavaştan hızlıya):**
+| Döngü | Kaynak | Ne yapar |
+|---|---|---|
+| Piyasa-durumu | `computeMarketBias` (5-10 dk) | risk_on/off → yön eğilimini çevirir |
+| Coin sıralama | `scoreCoin`+`selectUniverse` (5-10 dk) | evreni + yönü rejime göre yeniler |
+| Portföy maruziyeti | `exposureGuard` (giriş) | tek-yön/küme birikimini durdurur |
+| Açık-kitap | `reviewOpenPositions` (her tur) | tezi bozulan pozisyonu geri çeker |
+
+---
+
 ## 4. Entegrasyon noktaları (dosya dosya)
 
 | Katman | Değişiklik |
