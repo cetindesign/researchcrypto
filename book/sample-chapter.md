@@ -1,4 +1,4 @@
-# Chapter 7 — The Scam Playbook: How Crooks Target Beginners
+# Chapter 7. The Scam Playbook: How Crooks Target Beginners
 
 *(Sample chapter. This is the voice and format the rest of the book will follow.)*
 
