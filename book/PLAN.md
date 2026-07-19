@@ -55,6 +55,15 @@ Bu belge, kitabın uçtan uca nasıl üretileceğini ve nasıl ilerleyeceğimizi
 - Faz 0 hazır (bu commit). Onayınla Faz 1-2 tek oturumda çıkabilir; Faz 3-4 arkasından gelir.
 - Workflow arka planda çalışır; bittiğinde seni uyarır ve paketi teslim ederim.
 
+## Stil kuralları (TÜM bölümlerde zorunlu)
+
+- ❌ **Uzun tire "—" (em dash) ASLA kullanılmaz.** Yerine virgül, iki nokta (:), nokta veya
+  parantez kullan. (Not: Markdown bölüm ayıracı olan `---` bir yatay çizgidir, tire değil;
+  o kalabilir.)
+- Sade İngilizce, ikinci tekil şahıs ("you"), kısa paragraflar.
+- Her bölümde en az bir aksiyon: checklist, adım adım liste veya "how to beat it" kutusu.
+- Jargon girdiğinde hemen tek cümlede açıklanır.
+
 ## Dürüst notlar (yayından önce)
 
 - **Yatırım tavsiyesi değil:** Kitaba net bir sorumluluk reddi (disclaimer) konur.
