@@ -1,6 +1,6 @@
-# Crypto Without the Scams
+# Crypto 101: Real-World Knowledge for Beginners
 
-## A Complete Beginner's Guide to Buying, Storing, and Protecting Your First Cryptocurrency
+## Buy, store, and protect your first crypto, safely.
 
 Welcome. You are here because crypto sounds exciting and a little scary, and you would like to try it without losing your money to a scam. That is exactly what this book is for. You can finish it in a weekend, and by the end you will have made your first safe purchase and stored it securely.
 

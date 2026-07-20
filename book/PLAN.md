@@ -8,6 +8,7 @@ Bu belge, kitabın uçtan uca nasıl üretileceğini ve nasıl ilerleyeceğimizi
 
 | Karar | Seçim |
 |-------|-------|
+| Başlık | **Crypto 101: Real-World Knowledge for Beginners** (kilitlendi) |
 | Dil | İngilizce (ürün), Türkçe (aramızdaki planlama) |
 | Açı / hedef kitle | **Güvenlik-önce / anti-scam**: "dolandırılmadan güvenle ilk kripto alımını yap" |
 | Kapsam | Kısa & aksiyon odaklı, **~30-40 sayfa** |

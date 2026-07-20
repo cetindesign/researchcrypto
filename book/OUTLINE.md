@@ -1,4 +1,4 @@
-# Book Outline: *Crypto Without the Scams* (working title)
+# Book Outline: *Crypto 101: Real-World Knowledge for Beginners*
 
 **Angle:** Safety-first / anti-scam beginner guide
 **Length target:** ~30-40 pages · **Price:** $9
