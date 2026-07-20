@@ -32,11 +32,11 @@ Here is what makes all three avoidable: they follow predictable patterns, and pa
 
 We move in a deliberate order, one calm step at a time:
 
-- [ ] First, you'll learn how crypto actually works, in plain English.
-- [ ] Then, how to recognize and shut down the common scams.
-- [ ] Then, how to buy your first crypto safely from a trustworthy place.
-- [ ] Then, how to store it securely and protect your seed phrase.
-- [ ] Finally, a set of habits that keep you safe for the long run.
+- First, you'll learn how crypto actually works in plain English, and the handful of words you truly need.
+- Then, how to set up a wallet and protect your seed phrase, the master key to your crypto.
+- Then, how to choose a trustworthy exchange and make your first purchase, step by step.
+- Then, how to move crypto safely, and how to recognize and shut down every common scam.
+- Finally, a security checklist and calm habits that keep you safe for the long run.
 
 You can read it front to back in a weekend. Nothing here assumes you know anything yet.
 

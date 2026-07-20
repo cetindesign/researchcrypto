@@ -68,11 +68,11 @@ Here is what makes all three avoidable: they follow predictable patterns, and pa
 
 We move in a deliberate order, one calm step at a time:
 
-- [ ] First, you'll learn how crypto actually works, in plain English.
-- [ ] Then, how to recognize and shut down the common scams.
-- [ ] Then, how to buy your first crypto safely from a trustworthy place.
-- [ ] Then, how to store it securely and protect your seed phrase.
-- [ ] Finally, a set of habits that keep you safe for the long run.
+- First, you'll learn how crypto actually works in plain English, and the handful of words you truly need.
+- Then, how to set up a wallet and protect your seed phrase, the master key to your crypto.
+- Then, how to choose a trustworthy exchange and make your first purchase, step by step.
+- Then, how to move crypto safely, and how to recognize and shut down every common scam.
+- Finally, a security checklist and calm habits that keep you safe for the long run.
 
 You can read it front to back in a weekend. Nothing here assumes you know anything yet.
 
@@ -272,7 +272,7 @@ Get comfortable with these ideas and you have the foundation for everything else
 
 You have learned the risks. Now comes the fun part: actually getting some crypto. The good news is that your very first purchase can be simple and safe, as long as you start in the right place and go slowly.
 
-That "right place" is almost always a reputable exchange. Let me explain what that means and how to pick one, then walk you through your first buy step by step.
+That "right place" is almost always a reputable exchange. Let's look at what that means and how to pick one, then walk through your first buy step by step.
 
 ## CEX vs DEX: Where Should a Beginner Start?
 
@@ -332,7 +332,7 @@ That is it. Storing it more securely and moving it around come later. For now, t
 
 ## Start Small, On Purpose
 
-I cannot say this enough: your first purchase should be small enough that losing it entirely would not hurt. This is not pessimism. It is how smart beginners learn.
+It is worth repeating: your first purchase should be small enough that losing it entirely would not hurt. This is not pessimism. It is how smart beginners learn.
 
 A small first buy lets you practice the whole flow, buying, checking your balance, and later withdrawing, with almost nothing at stake. Mistakes made with a tiny amount are cheap lessons. The same mistakes with your savings are painful ones.
 
